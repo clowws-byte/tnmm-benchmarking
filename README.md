@@ -1,4 +1,4 @@
-# TNMM Benchmarking (Transfer Pricing)
+# TNMM Calculator (Transfer Pricing)
 
 Web app for Malaysian TNMM benchmarking: staff upload audited accounts, Mistral OCR reads them,
 figures are reviewed and adjusted, comparables are tested, and the arm's length range is exported

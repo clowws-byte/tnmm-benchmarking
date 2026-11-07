@@ -29,8 +29,8 @@
   const ADJ_SIGN = { less_interest:-1, less_dividend:-1, adj_invest_disposal:0, adj_invest_fv:0,
     less_rental_nonop:-1, adj_nontrade_forex:0, less_exceptional_income:-1, add_exceptional_expense:1 };
   const BASIS = {
-    YA2023:     { lo:0.375, hi:0.625, median:true,  label:'YA 2023 onwards: 37.5th - 62.5th percentile' },
-    PRE_YA2023: { lo:0.25,  hi:0.75,  median:false, label:'Before YA 2023: interquartile range (25th - 75th percentile)' }
+    YA2023:     { lo:0.375, hi:0.625, median:true,  label:'37.5th - 62.5th percentile' },
+    PRE_YA2023: { lo:0.25,  hi:0.75,  median:false, label:'25th - 75th percentile (interquartile range)' }
   };
   const TESTS = [
     { key:'activity', label:'Functional comparability' },

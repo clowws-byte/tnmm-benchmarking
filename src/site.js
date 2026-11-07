@@ -8,10 +8,9 @@
   const pct = v => (v === null || v === undefined || !isFinite(v)) ? '–' : (v < 0 ? '(' + (Math.abs(v) * 100).toFixed(2) + '%)' : (v * 100).toFixed(2) + '%');
   const mult = v => (v === null || v === undefined || !isFinite(v)) ? '–' : v.toFixed(2) + 'x';
   const PLI = { om: { label: 'Operating margin', f: pct }, ncp: { label: 'Net cost plus margin', f: pct }, berry: { label: 'Berry ratio', f: mult } };
-  const EXAMPLE = window.EXAMPLE_JOB;
 
   const state = {
-    jobs: [], job: null, tab: 'companies', isExample: false,
+    jobs: [], job: null, tab: 'upload', isExample: false, going: false, errors: {},
     sb: null, user: null, profile: null, ocr: {},
     saveState: 'idle', files: {}, busy: {}, aborts: {}
   };
@@ -29,6 +28,7 @@
     const job = state.job; if (!job || state.isExample) return;
     if (!state.sb || !state.user) return;
     if (saving) { saveAgain = true; return; }
+    if (!state.jobs.some(x => x.id === job.id)) state.jobs.unshift(JSON.parse(JSON.stringify(job)));
     saving = true; setSave('Saving…');
     try {
       const body = JSON.parse(JSON.stringify(job));
@@ -115,7 +115,7 @@
     state.jobs = jobs.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     if (firstLoad) {
       firstLoad = false;
-      if (state.jobs.length) openJob(state.jobs[0].id); else openExample();
+      if (state.jobs.length) openJob(state.jobs[0].id); else startFresh();
     } else if (state.job && !state.isExample && !saving) {
       // keep the open job; refresh only the list
     }
@@ -123,18 +123,19 @@
   }
 
   /* ---------------- job actions ---------------- */
-  function openExample() { state.job = T.normaliseJob(JSON.parse(JSON.stringify(EXAMPLE))); state.isExample = true; state.tab = 'results'; render(); }
+  /* A blank job kept in memory; it is saved on the first change. */
+  function startFresh() { const j = T.blankJob(); j.id = crypto.randomUUID(); j.title = 'New benchmarking'; j.basis = 'YA2023'; state.job = j; state.isExample = false; state.tab = 'upload'; render(); }
   function openJob(id) {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveNow(); }
     const cur = state.job && !state.isExample ? state.jobs.findIndex(x => x.id === state.job.id) : -1;
     if (cur >= 0) state.jobs[cur] = state.job;
     const j = state.jobs.find(x => x.id === id); if (!j) return;
-    state.job = T.normaliseJob(JSON.parse(JSON.stringify(j))); state.isExample = false; render();
+    state.job = T.normaliseJob(JSON.parse(JSON.stringify(j))); state.isExample = false; state.files = {}; state.ocr = {}; state.errors = {};
+    state.tab = (j.tp && T.num(j.tp.pl.rev)) || (j.comps || []).length ? 'results' : 'upload'; render();
   }
   function newJob() {
-    const j = T.blankJob(); j.id = crypto.randomUUID(); j.title = 'New benchmarking';
-    state.jobs.unshift(j); state.job = j; state.isExample = false; state.tab = 'companies';
-    touch(); render();
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveNow(); }
+    startFresh();
   }
   function saveExampleAsNew() {
     const j = T.normaliseJob(JSON.parse(JSON.stringify(state.job))); j.id = crypto.randomUUID(); j.title = (j.title || 'Benchmarking').replace(/\s*\(example\)\s*/i, '') + ' (copy)';
@@ -149,7 +150,7 @@
     confirmBox('Delete this job?', `“${esc(j.title)}” and its figures will be removed. Uploaded PDFs are never stored, so nothing else is affected.`, 'Delete job', async () => {
       state.jobs = state.jobs.filter(x => x.id !== j.id);
       try { await api('delete', { id: j.id }); } catch (e) { toast('Could not delete the job: ' + e.message); }
-      if (state.jobs.length) openJob(state.jobs[0].id); else openExample();
+      if (state.jobs.length) openJob(state.jobs[0].id); else startFresh();
     });
   }
 
@@ -163,7 +164,7 @@
   function renderRail() {
     const list = $('#jobs'); if (!list) return;
     const items = state.jobs.map(j => `<button class="job ${state.job && !state.isExample && state.job.id === j.id ? 'on' : ''}" data-job="${esc(j.id)}"><b>${esc(j.title || 'Untitled')}</b><small>${esc(j.tp && j.tp.name || 'No tested party yet')} · ${new Date(j.updatedAt || Date.now()).toLocaleDateString('en-GB')}</small></button>`).join('');
-    list.innerHTML = `<button class="job ${state.isExample ? 'on' : ''}" data-example="1"><b>Example: Pasti Seterus FY2023</b><small>Sample data, not saved</small></button>` + (items || '<p class="empty" style="padding:12px">No saved jobs yet.</p>');
+    list.innerHTML = items || '<p class="empty" style="padding:12px">No saved jobs yet. Your jobs appear here once you start one.</p>';
   }
 
   function renderMain() {
@@ -171,24 +172,23 @@
     const R = T.results(job);
     const accN = R.acc.length;
     m.innerHTML = `
-      ${state.isExample ? `<div class="banner">You are viewing the example job. Edits here are not saved; it shows how a finished job looks. <button class="btn sm primary" data-act="save-example">Save as new job</button></div>` : ''}
       ${headerHtml(job)}
-      ${tilesHtml(R)}
+      ${hasFigures(job) ? tilesHtml(R) : ''}
       <div class="tabs" role="tablist">
-        ${[['companies', 'Companies', 1 + job.comps.length], ['calc', 'Calculation'], ['reject', 'Rejection', accN + '/' + job.comps.length + ' accepted'], ['results', 'Results']]
+        ${[['upload', 'Upload & Go'], ['companies', 'Companies', 1 + job.comps.length], ['calc', 'Calculation'], ['reject', 'Rejection', hasFigures(job) && job.comps.length ? accN + '/' + job.comps.length + ' accepted' : undefined], ['results', 'Results']]
           .map(([k, l, c]) => `<button role="tab" data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${l}${c !== undefined ? `<span class="count">${esc(c)}</span>` : ''}</button>`).join('')}
       </div>
-      <section id="tabbody">${state.tab === 'companies' ? companiesHtml(job) : state.tab === 'calc' ? calcHtml(job, R) : state.tab === 'reject' ? rejectHtml(job, R) : resultsHtml(job, R)}</section>`;
+      <section id="tabbody">${state.tab === 'upload' ? uploadHtml(job) : state.tab === 'companies' ? companiesHtml(job) : state.tab === 'calc' ? calcHtml(job, R) : state.tab === 'reject' ? rejectHtml(job, R) : resultsHtml(job, R)}</section>`;
     $('#dl').disabled = !job.tp.name && !job.comps.length;
   }
 
   function headerHtml(job) {
-    return `<div class="head">
+    return `<div class="head"><div class="headttl"><span class="stepno">1</span><b>Set up</b></div>
       <div class="field wide"><label for="f-title">Job title</label><input id="f-title" data-fid="title" data-job-field="title" value="${esc(job.title)}"></div>
       <div class="field"><label for="f-tpfye">Tested party FYE</label><input id="f-tpfye" data-fid="tpfye" data-tp-field="fye" placeholder="31 Dec 2023" value="${esc(job.tp.fye)}"></div>
-      <div class="field"><label>Arm's length range basis</label><div class="seg" role="group">
-        <button data-basis="YA2023" class="${job.basis === 'YA2023' ? 'on' : ''}">YA 2023 onwards</button>
-        <button data-basis="PRE_YA2023" class="${job.basis === 'PRE_YA2023' ? 'on' : ''}">Before YA 2023</button></div></div>
+      <div class="field wide"><label>Arm's length range</label><div class="seg" role="group">
+        <button data-basis="PRE_YA2023" class="${job.basis === 'PRE_YA2023' ? 'on' : ''}">25th – 75th percentile</button>
+        <button data-basis="YA2023" class="${job.basis === 'YA2023' ? 'on' : ''}">37.5th – 62.5th percentile</button></div></div>
       <div class="field wide"><label for="f-wfrom">Comparable FYE window</label><div class="row">
         <input id="f-wfrom" type="month" data-fid="wfrom" data-job-field="windowFrom" value="${esc(job.windowFrom)}">
         <span>to</span>
@@ -364,7 +364,6 @@
     const b = e.target.closest('button, [data-drop]'); if (!b) return;
     if (b.dataset.auth) return showAuth(b.dataset.auth);
     if (b.dataset.job) return openJob(b.dataset.job);
-    if (b.dataset.example) return openExample();
     if (b.dataset.tab) { state.tab = b.dataset.tab; return render(); }
     if (b.dataset.basis) { state.job.basis = b.dataset.basis; touch(); return render(); }
     const act = b.dataset.act; if (!act) return;
@@ -373,29 +372,45 @@
     if (act === 'new') return newJob();
     if (act === 'dup') return duplicateJob();
     if (act === 'del') return deleteJob();
-    if (act === 'save-example') return saveExampleAsNew();
     if (act === 'download') return downloadExcel();
     if (act === 'add-comp') { state.job.comps.push(T.blankCompany(false)); touch(); return render(); }
     if (act === 'remove-comp') { const c = findCo(id); return confirmBox('Remove comparable?', `${esc(c.name || 'This comparable')} will be removed from this job.`, 'Remove', () => { state.job.comps = state.job.comps.filter(x => x.id !== id); delete state.files[id]; touch(); render(); }); }
     if (act === 'suggest-window') return suggestWindow();
     if (act === 'extract') return extract(id);
+    if (act === 'go') return goAll();
+    if (act === 'drop-file') { const c = findCo(id); delete state.files[id]; delete state.errors[id]; if (c && !c.isTested && !T.num(c.pl.rev)) state.job.comps = state.job.comps.filter(x => x.id !== id); touch(); return render(); }
     if (act === 'view-ocr') return viewOcr(id);
     if (act === 'stop') { const a = state.aborts[id]; if (a) a.abort(); return; }
     if (act === 'mark-checked') { const c = findCo(id); c.extraction.checked = true; touch(); return render(); }
   }
-  function suggestWindow() {
+  function suggestWindow(silent) {
     const d = parseFye(state.job.tp.fye);
-    if (!d) return toast('Enter the tested party FYE first, e.g. 31 Dec 2023');
+    if (!d) { if (!silent) toast('Enter the tested party FYE first, e.g. 31 Dec 2023'); return; }
     const from = new Date(d.getFullYear(), d.getMonth() - 5, 1), to = new Date(d.getFullYear(), d.getMonth() + 6, 1);
     const m = x => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0');
     state.job.windowFrom = m(from); state.job.windowTo = m(to);
-    if (!state.job.basis || state.job.basis === 'YA2023' || state.job.basis === 'PRE_YA2023') state.job.basis = d.getFullYear() >= 2023 ? 'YA2023' : 'PRE_YA2023';
+    if (silent) return;
     touch(); render();
   }
   function parseFye(s) { if (!s) return null; const d = new Date(String(s).replace(/(\d+)(st|nd|rd|th)/, '$1')); return isNaN(d) ? null : d; }
 
   /* ---------------- files & extraction (Mistral OCR via the tnmm-ocr Edge Function) ---------------- */
+  function okFile(f) {
+    if (!/^(application\/pdf|image\/(png|jpeg|webp))$/.test(f.type)) { toast(`${f.name}: upload a PDF or a PNG/JPEG page image.`); return false; }
+    if (f.size > 20 * 1048576) { toast(`${f.name} is over 20 MB. Upload only the financial statements pages.`); return false; }
+    return true;
+  }
   function onFile(id, fileList) {
+    if (id === 'tp') id = state.job.tp.id;
+    if (id === 'comps') {
+      const files = Array.from(fileList || []).filter(okFile);
+      files.forEach(f => {
+        const c = T.blankCompany(false); c.name = f.name.replace(/\.(pdf|png|jpe?g|webp)$/i, ''); c.source = { file: f.name };
+        state.job.comps.push(c); state.files[c.id] = { file: f, name: f.name, size: f.size };
+      });
+      if (files.length) { touch(); render(); }
+      return;
+    }
     const f = (fileList || [])[0]; if (!f) return;
     if (!/^(application\/pdf|image\/(png|jpeg|webp))$/.test(f.type)) return toast('Upload a PDF or a PNG/JPEG page image.');
     if (f.size > 20 * 1048576) return toast('That file is over 20 MB. Upload only the financial statements pages.');
@@ -403,7 +418,7 @@
     delete state.ocr[id];
     const c = findCo(id); c.source = { file: f.name }; touch(); render();
   }
-  function setBusy(id, msg, p) { state.busy[id] = { msg, p }; if (state.tab === 'companies') renderMain(); }
+  function setBusy(id, msg, p) { state.busy[id] = { msg, p }; if (state.tab === 'companies' || state.tab === 'upload') renderMain(); }
 
   /* Pick the pages that matter from the OCR text: the profit or loss statement and the notes behind it. */
   function scorePage(md, i) {
@@ -421,7 +436,7 @@
     if (/statements? of (changes in equity|cash flows)/.test(t) && s < 10) s -= 3;
     return s;
   }
-  async function extract(id) {
+  async function extract(id, quiet) {
     const job = state.job, c = findCo(id), f = state.files[id];
     if (!c || !f || state.busy[id]) return;
     const ctl = new AbortController(); state.aborts[id] = ctl;
@@ -440,12 +455,62 @@
       const win = job.windowFrom && job.windowTo ? `between ${T.fmtMonth(job.windowFrom)} and ${T.fmtMonth(job.windowTo)}` : '';
       const out = await api('extract', { pages: pick, role: c.isTested ? 'tested' : 'comparable', fye: job.tp.fye, window: win }, { signal: ctl.signal });
       applyExtraction(c, out.result, pick.map(p => p.index + 1));
-      toast(`${c.name || 'Company'}: figures read. Please check them against the accounts.`);
+      delete state.errors[id];
+      if (!quiet) toast(`${c.name || 'Company'}: figures read. Please check them against the accounts.`);
     } catch (e) {
-      toast(e && e.name === 'AbortError' ? 'Stopped.' : (e && e.message) || 'Reading failed. Try again.');
+      const msg = e && e.name === 'AbortError' ? 'Stopped.' : (e && e.message) || 'Reading failed. Try again.';
+      state.errors[id] = msg;
+      if (!quiet) toast(msg);
     } finally {
       delete state.busy[id]; delete state.aborts[id]; render();
     }
+  }
+  async function goAll() {
+    const job = state.job;
+    const ids = [job.tp, ...job.comps].filter(c => state.files[c.id] && !(c.extraction && c.extraction.at)).map(c => c.id);
+    if (!state.files[job.tp.id] && !T.num(job.tp.pl.rev)) return toast('Upload the tested party accounts first.');
+    if (!job.comps.length) return toast('Upload at least one comparable.');
+    if (!ids.length) { state.tab = 'results'; return render(); }
+    state.going = true; render();
+    let i = 0;
+    const worker = async () => { while (i < ids.length) { const id = ids[i++]; await extract(id, true); } };
+    await Promise.all([worker(), worker()]);
+    state.going = false;
+    const failed = ids.filter(id => state.errors[id]).length;
+    if (!failed) state.tab = 'results';
+    render();
+    toast(failed ? `${ids.length - failed} read, ${failed} could not be read. See the list for details.` : 'All figures read. Check them in Companies and Calculation.');
+  }
+  function hasFigures(job) { return T.num(job.tp.pl.rev) !== 0 || job.comps.some(c => T.num(c.pl.rev) !== 0); }
+  function queueRow(c) {
+    const f = state.files[c.id], busy = state.busy[c.id], err = state.errors[c.id];
+    const done = c.extraction && c.extraction.at;
+    const st = busy ? `<span class="chip warn">${esc(busy.msg.split('.')[0])}</span>` : err ? `<span class="chip bad" title="${esc(err)}">Not read</span>` : done ? '<span class="chip good">Read</span>' : f ? '<span class="chip mute">Ready</span>' : T.num(c.pl.rev) ? '<span class="chip mute">Entered</span>' : '<span class="chip mute">No file</span>';
+    return `<li class="${c.isTested ? 'q-tp' : 'q-cp'}"><span class="qname"><b>${esc(c.name || (c.isTested ? 'Tested party' : 'Comparable'))}</b><small>${esc(f ? f.name : (c.source && c.source.file) || '')}${err ? ' · ' + esc(err) : ''}</small></span>${st}
+      ${!busy && f && !state.going ? `<button class="btn sm ghost" data-act="drop-file" data-id="${esc(c.id)}" aria-label="Remove ${esc(c.name || 'file')}">✕</button>` : ''}</li>`;
+  }
+  function uploadHtml(job) {
+    const tpFile = state.files[job.tp.id];
+    const pending = [job.tp, ...job.comps].filter(c => state.files[c.id] && !(c.extraction && c.extraction.at)).length;
+    return `<div class="steps">
+      <div class="step">
+        <div class="headttl"><span class="stepno s2">2</span><b>Upload audited accounts</b></div>
+        <div class="ups">
+          <label class="up tp" data-drop="tp"><input type="file" data-file="tp" accept="application/pdf,image/png,image/jpeg,image/webp">
+            <span class="upicon" aria-hidden="true">▣</span><b>Tested party</b>
+            <span>${tpFile ? esc(tpFile.name) : job.tp.name && T.num(job.tp.pl.rev) ? esc(job.tp.name) + ' · figures in' : 'One PDF · click or drop here'}</span></label>
+          <label class="up cp" data-drop="comps"><input type="file" data-file="comps" multiple accept="application/pdf,image/png,image/jpeg,image/webp">
+            <span class="upicon" aria-hidden="true">▤</span><b>Comparables</b>
+            <span>${job.comps.length ? job.comps.length + ' compan' + (job.comps.length === 1 ? 'y' : 'ies') + ' · add more' : 'One PDF per company · select several'}</span></label>
+        </div>
+        ${(tpFile || job.comps.length || T.num(job.tp.pl.rev)) ? `<ul class="queue">${[job.tp, ...job.comps].filter(c => c.isTested ? (tpFile || T.num(c.pl.rev) || state.errors[c.id]) : true).map(queueRow).join('')}</ul>` : ''}
+      </div>
+      <div class="step gostep">
+        <div class="headttl"><span class="stepno s3">3</span><b>Calculate</b></div>
+        <button class="go" data-act="go" ${state.going ? 'disabled' : ''}><span aria-hidden="true">=</span> ${state.going ? 'Working…' : 'Go'}</button>
+        <p class="meta">${state.going ? 'Reading each file with OCR and mapping the figures. Keep this tab open.' : pending ? `${pending} file${pending === 1 ? '' : 's'} to read. Go reads them, then shows the arm's length range.` : hasFigures(job) ? 'All files read. Go shows the results.' : 'Upload the files, then press Go.'}</p>
+      </div>
+    </div>`;
   }
   function viewOcr(id) {
     const o = state.ocr[id]; if (!o) return;
@@ -475,6 +540,9 @@
     if (k.pbtCheck === false) w.push(`Computed PBT ${fmt(k.pbt)} does not agree to the accounts (${fmt(T.num(c.pbtReported))}). Check the line mapping.`);
     c.warnings = w;
     c.extraction = { at: Date.now(), pages, checked: false };
+    const job = state.job;
+    if (c.isTested && (!job.title || job.title === 'New benchmarking') && c.name) job.title = c.name + (c.fye ? ' – FYE ' + c.fye : '');
+    if (c.isTested && c.fye && !job.windowFrom) suggestWindow(true);
     touch();
   }
 
@@ -516,6 +584,5 @@
   document.addEventListener('dragleave', e => { const d = e.target.closest('[data-drop]'); if (d) d.classList.remove('over'); });
   document.addEventListener('drop', e => { const d = e.target.closest('[data-drop]'); if (d) { e.preventDefault(); onFile(d.dataset.drop, e.dataTransfer.files); } });
 
-  openExample();
   initAuth();
 })();
