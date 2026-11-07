@@ -12,7 +12,7 @@
   const state = {
     jobs: [], job: null, tab: 'upload', isExample: false, going: false, errors: {},
     sb: null, user: null, profile: null, ocr: {},
-    saveState: 'idle', files: {}, busy: {}, aborts: {}
+    saveState: 'idle', files: {}, busy: {}, aborts: {}, why: {}
   };
 
   /* ---------------- persistence ---------------- */
@@ -563,7 +563,8 @@
         setBusy(id, 'Free OCR on the image…', 0.2);
         const w = await tessWorker(); stopIf(signal);
         const { data } = await w.recognize(file);
-        return data.confidence >= 55 && goodText(data.text) ? [{ index: 0, markdown: data.text }] : null;
+        if (data.confidence >= 55 && goodText(data.text)) return [{ index: 0, markdown: data.text }];
+        state.why[id] = `image too unclear for free OCR (confidence ${Math.round(data.confidence)}%)`; return null;
       }
       setBusy(id, 'Opening the PDF…', 0.08);
       await loadScript(LIB.pdf);
@@ -596,14 +597,16 @@
           cv.width = cv.height = 0;
           if (goodText(data.text)) { pages.push({ index: todo[k], markdown: data.text }); conf += data.confidence || 0; good++; }
         }
-        if (!good || conf / good < 50) return null; // blank or too blurry for free OCR
+        if (!good || conf / good < 50) { state.why[id] = good ? `scan too unclear for free OCR (confidence ${Math.round(conf / good)}%)` : 'no readable text found on the scanned pages'; return null; }
         pages.sort((a, b) => a.index - b.index);
       }
       doc.destroy();
+      if (!pages.length) state.why[id] = 'no readable text in the PDF';
       return pages.length ? pages : null;
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
       console.warn('Free reading failed, using server OCR instead:', e);
+      state.why[id] = 'free reader error: ' + String((e && e.message) || e).slice(0, 120);
       return null;
     }
   }
@@ -612,7 +615,8 @@
     setBusy(id, 'Checking the file…', 0.08);
     const buf = await f.file.arrayBuffer();
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
-    const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash }, { signal: ctl.signal });
+    const why = state.why[id] || 'server OCR';
+    const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash, why }, { signal: ctl.signal });
     if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
     else {
       await uploadDirect(st.upload, new Blob([buf], { type: fm.mime }), ctl.signal, pct => setBusy(id, `Uploading the file (${pct}%)…`, 0.08 + pct / 100 * 0.12));
@@ -622,10 +626,10 @@
     for (;;) {
       await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
       const secs = Math.round((Date.now() - t0) / 1000);
-      if (!st.reused) setBusy(id, `Running OCR on every page (${secs}s). Scanned accounts can take a few minutes…`, Math.min(0.55, 0.2 + secs / 400));
+      if (!st.reused) setBusy(id, `Free reading not possible (${why}). Using Gemini OCR (${secs}s)…`, Math.min(0.55, 0.2 + secs / 400));
       const r = await api('ocr_status', { run: st.run }, { signal: ctl.signal });
       if (r.status === 'done') return r.pages || [];
-      if (r.status === 'error') throw new Error(r.error || 'OCR failed. Try again.');
+      if (r.status === 'error') throw new Error(`Free reading not possible (${why}), and paid OCR failed: ${r.error || 'unknown error'}`);
       if (secs > 600) throw new Error('OCR is taking too long. Try a smaller file with only the financial statements pages.');
     }
   }
@@ -638,6 +642,7 @@
       if (!pages) {
         const fm = fileMode(f.file);
         if (fm.mode === 'ocr' && (fm.mime === 'application/pdf' || fm.mime.startsWith('image/'))) {
+          delete state.why[id];
           pages = await browserRead(f.file, fm.mime, id, ctl.signal);
           if (!pages) pages = await serverOcr(id, f, fm, ctl);
         } else if (fm.mode === 'ocr') {

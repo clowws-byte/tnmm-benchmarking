@@ -16,7 +16,7 @@ const MAX_FILE = 50 * 1024 * 1024;
 // Google Gemini (preferred when its key is set). Accepts any of these secret names.
 const GEMINI_KEY = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY", "GEMINI_KEY"].map(n => Deno.env.get(n)).find(Boolean) || "";
 const GEMINI = "https://generativelanguage.googleapis.com";
-const GEMINI_MODELS = [Deno.env.get("GEMINI_MODEL"), "gemini-flash-latest", "gemini-2.5-flash"].filter(Boolean) as string[];
+const GEMINI_MODELS = [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"].filter(Boolean) as string[])];
 // File types the server can OCR (only used when reading in the browser fails).
 const OCR_TYPES = /^(application\/pdf|image\/(png|jpeg|webp|gif|avif)|application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|presentationml\.presentation))$/;
 
@@ -78,21 +78,26 @@ function geminiError(what: string, status: number, text: string) {
   return `${what} failed (${status}): ${text.slice(0, 200)}`;
 }
 async function geminiGenerate(parts: any[], json: boolean, maxTokens = 8192) {
-  let last: Response | null = null;
+  let last: Response | null = null, lastErr = "";
   for (const model of GEMINI_MODELS) {
     const r = await retryFetch(`${GEMINI}/v1beta/models/${model}:generateContent`, {
       method: "POST", headers: { "x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({ contents: [{ role: "user", parts }],
         generationConfig: { temperature: 0, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) } }),
-    });
-    if (r.status === 404) { last = r; await r.body?.cancel(); continue; } // model name not available: try the next one
-    if (!r.ok) return { error: geminiError("Gemini", r.status, await r.text()) };
+    }, 2);
+    if (!r.ok) {
+      const t = await r.text();
+      console.log(`gemini ${model} ${r.status}: ${t.slice(0, 600)}`);
+      lastErr = geminiError("Gemini", r.status, t);
+      if (r.status === 404 || r.status === 429) { last = r; continue; } // model not available / no quota on it: try the next model
+      return { error: lastErr };
+    }
     const out = await r.json();
     const text = (out.candidates?.[0]?.content?.parts || []).map((p: any) => p.text || "").join("");
     if (!text) return { error: "Gemini returned no text (" + (out.candidates?.[0]?.finishReason || out.promptFeedback?.blockReason || "empty") + ")." };
     return { text, model };
   }
-  return { error: `No Gemini model was available (${last?.status}). Set GEMINI_MODEL in Supabase secrets to a model your key can use.` };
+  return { error: last?.status === 429 ? lastErr : `No Gemini model was available (${last?.status}). Set GEMINI_MODEL in Supabase secrets to a model your key can use.` };
 }
 /* Upload a file to the Gemini Files API (resumable protocol) and wait until it can be used. */
 async function geminiUpload(bytes: Uint8Array, mime: string, name: string) {
@@ -102,12 +107,12 @@ async function geminiUpload(bytes: Uint8Array, mime: string, name: string) {
       "X-Goog-Upload-Header-Content-Length": String(bytes.length), "X-Goog-Upload-Header-Content-Type": mime, "Content-Type": "application/json" },
     body: JSON.stringify({ file: { display_name: name.slice(0, 100) } }),
   });
-  if (!start.ok) throw new Error(geminiError("Upload to Gemini", start.status, await start.text()));
+  if (!start.ok) { const t = await start.text(); console.log(`gemini upload ${start.status}: ${t.slice(0, 600)}`); throw new Error(geminiError("Upload to Gemini", start.status, t)); }
   const url = start.headers.get("x-goog-upload-url");
   await start.body?.cancel();
   if (!url) throw new Error("Gemini did not return an upload link.");
   const up = await fetch(url, { method: "POST", headers: { "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize", "Content-Length": String(bytes.length) }, body: bytes });
-  if (!up.ok) throw new Error(geminiError("Upload to Gemini", up.status, await up.text()));
+  if (!up.ok) { const t = await up.text(); console.log(`gemini upload ${up.status}: ${t.slice(0, 600)}`); throw new Error(geminiError("Upload to Gemini", up.status, t)); }
   let file = (await up.json()).file;
   for (let i = 0; file?.state === "PROCESSING" && i < 30; i++) {
     await new Promise(r => setTimeout(r, 2000));
@@ -279,6 +284,7 @@ Deno.serve(async (req) => {
       const hash = String(b.hash || "").toLowerCase();
       const size = Number(b.size) || 0;
       const name = String(b.name || "accounts").slice(0, 120);
+      console.log(`ocr_start ${name}: browser reading not used because: ${String(b.why || "").slice(0, 200)}`);
       if (!OCR_TYPES.test(mime)) return json({ error: "This file type cannot be read. Use PDF, Word, PowerPoint, an image, Excel or CSV." }, 415);
       if (!/^[0-9a-f]{64}$/.test(hash)) return json({ error: "Bad request." }, 400);
       if (!size) return json({ error: "The file was empty." }, 400);
