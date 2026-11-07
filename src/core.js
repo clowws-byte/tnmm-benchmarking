@@ -231,36 +231,39 @@
     cols.forEach(col => S(col + r, `=IF(${col}${rows.opex}=0,"",${col}${rows.gp}/${col}${rows.opex})`, { fmt: MULT, bord: true }));
     rows.berry = r; r += 3;
 
-    const hcols = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
+    // Same columns, in the same order, as the Rejection tab on screen
+    const hcols = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M'];
     section(r, '5.  REJECTION CRITERIA', HDRF, WHITEB, hcols.slice(1)); r += 2;
-    const heads = ['Comparable', 'Turnover', "Turnover >= 10% of tested party's revenue?", 'RPT sales %', 'RPT purchases %',
-      `RPT sales and purchases each <= ${Math.round(thr * 100)}%?`, 'Functional comparability?', 'Sufficient & verifiable data?',
-      'No start-up / bankrupt / dormant?', 'CONCLUSION'];
+    const heads = ['Comparable', 'Turnover (RM)', "Turnover >= 10% of tested party's revenue?", 'RPT sales (RM)', 'RPT sales %',
+      'RPT purchases (RM)', 'RPT purchases %', `RPT sales and purchases each <= ${Math.round(thr * 100)}%?`,
+      'Functional comparability', 'Sufficient & verifiable data', 'No start-up / bankrupt / dormant', 'Reason', 'CONCLUSION'];
     hcols.forEach((hc, i) => S(hc + r, heads[i], { font: WHITEB, fill: SUBHF, wrap: true, align: 'center', bord: true }));
     ws.getRow(r).height = 48;
-    [['L', 'RPT sales'], ['M', 'RPT purchases']].forEach(([hc, t]) => S(hc + r, t, { font: WHITEB, fill: SUBHF, wrap: true, align: 'center', bord: true }));
     r++;
     const TPrev = `$${tpCol}$${rows.rev}`;
     const rej = {};
     compCols.forEach(col => {
       const cc = by[col];
+      const reason = Object.values(cc.reasons || {}).filter(Boolean).join(' ');
       S('A' + r, `${cc.name || ''}  (${String(cc.regno || '').split(' ')[0]})`, { wrap: true, bord: true });
       S('B' + r, `=${col}${rows.rev}`, { fmt: NUM, bord: true });
-      if (cc.sizeAcceptedByIrbm) S('C' + r, 'Pass', { font: BLUE, align: 'center', bord: true });
+      if (cc.sizeAcceptedByIrbm) S('C' + r, 'Pass (accepted by IRBM)', { font: BLUE, align: 'center', wrap: true, bord: true });
       else S('C' + r, `=IF(B${r}>=0.1*${TPrev},"Pass","Fail")`, { align: 'center', bord: true });
-      S('L' + r, num(cc.rpt.sales), { font: BLUE, fmt: NUM, bord: true });
-      S('M' + r, num(cc.rpt.purchases), { font: BLUE, fmt: NUM, bord: true });
-      S('D' + r, `=IF(B${r}=0,0,L${r}/B${r})`, { fmt: PCT, bord: true });
-      S('E' + r, `=IF(B${r}=0,0,M${r}/B${r})`, { fmt: PCT, bord: true });
-      S('F' + r, `=IF(OR(D${r}>${thr},E${r}>${thr}),"Fail","Pass")`, { align: 'center', bord: true });
-      [['G', 'activity'], ['H', 'data'], ['I', 'special']].forEach(([hc, k]) => S(hc + r, (cc.tests && cc.tests[k]) || 'Pass', { font: BLUE, align: 'center', bord: true }));
-      S('J' + r, `=IF(AND(C${r}="Pass",F${r}="Pass",G${r}="Pass",H${r}="Pass",I${r}="Pass"),"ACCEPTED","REJECTED")`, { font: BLACKB, align: 'center', bord: true });
+      S('D' + r, num(cc.rpt.sales), { font: BLUE, fmt: NUM, bord: true });
+      S('E' + r, `=IF(B${r}=0,0,D${r}/B${r})`, { fmt: PCT, bord: true });
+      S('F' + r, num(cc.rpt.purchases), { font: BLUE, fmt: NUM, bord: true });
+      S('G' + r, `=IF(B${r}=0,0,F${r}/B${r})`, { fmt: PCT, bord: true });
+      S('H' + r, `=IF(OR(E${r}>${thr},G${r}>${thr}),"Fail","Pass")`, { align: 'center', bord: true });
+      [['I', 'activity'], ['J', 'data'], ['K', 'special']].forEach(([hc, k]) => S(hc + r, (cc.tests && cc.tests[k]) || 'Pass', { font: BLUE, align: 'center', bord: true }));
+      S('L' + r, reason, { font: BLUE, wrap: true, bord: true });
+      S('M' + r, `=IF(AND(LEFT(C${r},4)="Pass",H${r}="Pass",I${r}="Pass",J${r}="Pass",K${r}="Pass"),"ACCEPTED","REJECTED")`, { font: BLACKB, align: 'center', bord: true });
+      if (reason.length > 40) ws.getRow(r).height = Math.min(120, 15 * Math.ceil(reason.length / 40));
       rej[col] = r++;
     });
 
     ws.getColumn('A').width = 52;
     new Set([...cols, ...hcols.slice(1)]).forEach(col => { ws.getColumn(col).width = 16; });
-    ['L', 'M'].forEach(col => { ws.getColumn(col).width = 14; });
+    ws.getColumn('L').width = Math.max(ws.getColumn('L').width || 16, 36);
 
     /* Summary */
     const s = wb.addWorksheet('Summary of Interquartile', { views: [{ showGridLines: false }] });
@@ -281,7 +284,7 @@
     compCols.forEach(col => {
       const cc = by[col];
       SS('A' + r, `${cc.name || ''} (${String(cc.regno || '').split(' ')[0]})`, { bord: true });
-      SS('B' + r, `=IF(Calculation!J${rej[col]}="ACCEPTED","Yes","No")`, { font: GREEN, align: 'center', bord: true });
+      SS('B' + r, `=IF(Calculation!M${rej[col]}="ACCEPTED","Yes","No")`, { font: GREEN, align: 'center', bord: true });
       SS('C' + r, `=IF($B${r}="Yes",Calculation!${col}${rows.ros},"")`, { font: GREEN, fmt: PCT, bord: true });
       SS('D' + r, `=IF($B${r}="Yes",Calculation!${col}${rows.ncpm},"")`, { font: GREEN, fmt: PCT, bord: true });
       SS('E' + r, `=IF($B${r}="Yes",Calculation!${col}${rows.berry},"")`, { font: GREEN, fmt: MULT, bord: true });
