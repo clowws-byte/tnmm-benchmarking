@@ -6,10 +6,13 @@ to a formula-driven Excel workbook (two tabs: Calculation, Summary of Interquart
 
 - Site: GitHub Pages, single `index.html` (built from `src/` with `python3 build.py`).
 - Backend: Supabase project **Transfer Pricing** (`fqxxrqjrbhrifybzxvly`, Singapore).
-  - Auth: email + password; new accounts wait for admin approval (`tp_profiles.status`).
-  - `tnmm_jobs`: saved jobs, private to each user (admins can read all).
-  - Storage bucket `tnmm-uploads`: the uploaded file is deleted as soon as OCR finishes.
-  - Edge Function `tnmm-ocr`: calls Mistral OCR, then Mistral chat to map lines. Needs the
+  - Sign-in: staff sign in once in the **CCTaxLab portal** (same address, clowws-byte.github.io), and this
+    app reads that session. The `tnmm-api` Edge Function re-checks the token with CCTaxLab on every call and
+    allows only people who can see the TNMM application in CCTaxLab (Admin → Access), plus CCTaxLab admins.
+    The application must be listed in CCTaxLab with a link containing `tnmm-benchmarking`.
+  - `tnmm_jobs`: saved jobs keyed by CCTaxLab user id, reached only through the Edge Function.
+  - Uploaded accounts go straight to the function and on to Mistral; they are never stored.
+  - Edge Function `tnmm-api`: jobs, Mistral OCR, then Mistral chat to map lines. Needs the
     secret `MISTRAL_API_KEY` (Supabase → Edge Functions → Secrets). Optional overrides:
     `MISTRAL_OCR_MODEL`, `MISTRAL_CHAT_MODEL`.
 - Rules follow the `tnmm-benchmarking-v3` skill: IRBM-supported adjustments only, 10% size test,

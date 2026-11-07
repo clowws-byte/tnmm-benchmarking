@@ -1,24 +1,50 @@
-// TNMM Benchmarking: OCR audited accounts with Mistral and map them to TNMM lines.
-// The Mistral key lives only here, as the MISTRAL_API_KEY secret.
+// TNMM Benchmarking API (Transfer Pricing project).
+// Staff sign in through the CCTaxLab portal; this function verifies that sign-in with CCTaxLab and
+// checks the person can see the TNMM application there (portal visibility rules and Access grants).
+// Jobs live in public.tnmm_jobs here; Mistral OCR runs here with the MISTRAL_API_KEY secret.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 
+const CCT_URL = "https://orszbsqshrzhjgtlihzc.supabase.co";
+const CCT_KEY = "sb_publishable_by4wqCu53U9son8u0kp1qA_Uij0ysHW"; // CCTaxLab public (publishable) key
+const APP_MATCH = Deno.env.get("TNMM_PORTAL_URL_MATCH") ?? "tnmm-benchmarking";
+const MISTRAL = "https://api.mistral.ai/v1";
+const OCR_MODEL = Deno.env.get("MISTRAL_OCR_MODEL") ?? "mistral-ocr-latest";
+const CHAT_MODEL = Deno.env.get("MISTRAL_CHAT_MODEL") ?? "mistral-large-latest";
+const MAX_FILE = 20 * 1024 * 1024;
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-file-name",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
-const MISTRAL = "https://api.mistral.ai/v1";
-const OCR_MODEL = Deno.env.get("MISTRAL_OCR_MODEL") ?? "mistral-ocr-latest";
-const CHAT_MODEL = Deno.env.get("MISTRAL_CHAT_MODEL") ?? "mistral-large-latest";
+async function cct(path: string, token: string) {
+  const r = await fetch(CCT_URL + path, { headers: { apikey: CCT_KEY, Authorization: `Bearer ${token}` } });
+  return r.ok ? await r.json() : null;
+}
+
+/* Who is calling, and may they use TNMM? Uses the caller's own CCTaxLab token, so CCTaxLab's RLS decides. */
+async function identify(token: string) {
+  if (!token) return { error: "signin" };
+  const user = await cct("/auth/v1/user", token);
+  if (!user?.id) return { error: "signin" };
+  const [profs, tools] = await Promise.all([
+    cct(`/rest/v1/portal_profiles?select=full_name,email,status,is_admin,branch&id=eq.${user.id}`, token),
+    cct(`/rest/v1/portal_tools?select=id,name&url=ilike.*${encodeURIComponent(APP_MATCH)}*`, token),
+  ]);
+  const profile = Array.isArray(profs) ? profs[0] : null;
+  if (!profile || profile.status !== "approved") return { error: "not_approved", user, profile };
+  const access = !!profile.is_admin || (Array.isArray(tools) && tools.length > 0);
+  if (!access) return { error: "no_access", user, profile };
+  return { user, profile };
+}
 
 function b64(bytes: Uint8Array): string {
   let s = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) s += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(s);
 }
 
@@ -65,32 +91,68 @@ Use warnings for anything a reviewer should check (unclear figures, missing note
 ${body}`;
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ error: "Use POST." }, 405);
 
-  const key = Deno.env.get("MISTRAL_API_KEY");
-  if (!key) return json({ error: "The OCR key is not set up yet. An admin needs to add MISTRAL_API_KEY in Supabase Edge Function secrets." }, 503);
-
-  const url = Deno.env.get("SUPABASE_URL")!;
-  const admin = createClient(url, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
   const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
-  const { data: u, error: ue } = await admin.auth.getUser(token);
-  if (ue || !u?.user) return json({ error: "Please sign in again." }, 401);
-  const { data: prof } = await admin.from("tp_profiles").select("status").eq("id", u.user.id).maybeSingle();
-  if (!prof || prof.status !== "approved") return json({ error: "Your account is not approved yet." }, 403);
+  const who = await identify(token);
+  const action = new URL(req.url).searchParams.get("action") ?? "";
 
-  let body: any;
-  try { body = await req.json(); } catch { return json({ error: "Bad request." }, 400); }
+  if (action === "me") {
+    return json({ ok: !who.error, reason: who.error ?? null,
+      profile: who.profile ? { name: who.profile.full_name, email: who.profile.email, admin: !!who.profile.is_admin, branch: who.profile.branch } : null });
+  }
+  if (who.error) {
+    const msg = who.error === "signin" ? "Please sign in to CCTaxLab again." : who.error === "not_approved" ? "Your CCTaxLab account is not approved." : "You don't have access to TNMM Benchmarking. Ask an admin to grant it in CCTaxLab → Admin → Access.";
+    return json({ error: msg, reason: who.error }, who.error === "signin" ? 401 : 403);
+  }
+  const uid = who.user.id as string;
+  const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
   try {
-    if (body.action === "ocr") {
-      const path = String(body.path || "");
-      if (!path.startsWith(u.user.id + "/")) return json({ error: "File not found." }, 404);
-      const { data: file, error: fe } = await admin.storage.from("tnmm-uploads").download(path);
-      if (fe || !file) return json({ error: "The uploaded file could not be read." }, 404);
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const mime = file.type || (path.endsWith(".pdf") ? "application/pdf" : "image/jpeg");
+    if (action === "list") {
+      const { data, error } = await db.from("tnmm_jobs").select("id,title,job,updated_at").eq("owner", uid).order("updated_at", { ascending: false });
+      if (error) throw error;
+      return json({ jobs: data });
+    }
+
+    if (action === "save") {
+      const b = await req.json();
+      if (!UUID.test(String(b.id || "")) || typeof b.job !== "object") return json({ error: "Bad job." }, 400);
+      if (JSON.stringify(b.job).length > 2_000_000) return json({ error: "This job is too large to save." }, 413);
+      const { data: cur } = await db.from("tnmm_jobs").select("owner").eq("id", b.id).maybeSingle();
+      if (cur && cur.owner !== uid) return json({ error: "This job belongs to someone else." }, 403);
+      const { error } = await db.from("tnmm_jobs").upsert({
+        id: b.id, owner: uid, owner_email: who.profile.email ?? "", owner_name: who.profile.full_name ?? "",
+        title: String(b.title || "").slice(0, 200), job: b.job, updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      return json({ ok: true });
+    }
+
+    if (action === "delete") {
+      const b = await req.json();
+      if (!UUID.test(String(b.id || ""))) return json({ error: "Bad job." }, 400);
+      const { error } = await db.from("tnmm_jobs").delete().eq("id", b.id).eq("owner", uid);
+      if (error) throw error;
+      return json({ ok: true });
+    }
+
+    const key = Deno.env.get("MISTRAL_API_KEY");
+    if (action === "ocr" || action === "extract") {
+      if (!key) return json({ error: "The OCR key is not set up yet. An admin needs to add MISTRAL_API_KEY in Supabase Edge Function secrets." }, 503);
+    }
+
+    if (action === "ocr") {
+      // the file arrives as the raw request body and is never stored
+      const mime = (req.headers.get("Content-Type") || "").split(";")[0].trim();
+      if (!/^(application\/pdf|image\/(png|jpeg|webp))$/.test(mime)) return json({ error: "Upload a PDF or a PNG/JPEG image." }, 415);
+      const bytes = new Uint8Array(await req.arrayBuffer());
+      if (!bytes.length) return json({ error: "The file was empty." }, 400);
+      if (bytes.length > MAX_FILE) return json({ error: "The file is over 20 MB. Upload only the financial statements pages." }, 413);
       const document = mime === "application/pdf"
         ? { type: "document_url", document_url: `data:application/pdf;base64,${b64(bytes)}` }
         : { type: "image_url", image_url: `data:${mime};base64,${b64(bytes)}` };
@@ -99,34 +161,28 @@ Deno.serve(async (req) => {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body: JSON.stringify({ model: OCR_MODEL, document, include_image_base64: false }),
       });
-      // the uploaded accounts are not kept once OCR has run
-      await admin.storage.from("tnmm-uploads").remove([path]);
       if (!r.ok) return json({ error: `Mistral OCR failed (${r.status}): ${(await r.text()).slice(0, 300)}` }, 502);
       const out = await r.json();
-      const pages = (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") }));
-      return json({ pages });
+      return json({ pages: (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") })) });
     }
 
-    if (body.action === "extract") {
-      const pages = (Array.isArray(body.pages) ? body.pages : []).slice(0, 30)
+    if (action === "extract") {
+      const b = await req.json();
+      const pages = (Array.isArray(b.pages) ? b.pages : []).slice(0, 30)
         .map((p: any) => ({ index: Number(p.index) || 0, markdown: String(p.markdown || "").slice(0, 40000) }));
       if (!pages.length) return json({ error: "No pages were sent." }, 400);
-      const ctx = { role: body.role === "tested" ? "tested" : "comparable", fye: String(body.fye || ""), window: String(body.window || "") };
+      const ctx = { role: b.role === "tested" ? "tested" : "comparable", fye: String(b.fye || ""), window: String(b.window || "") };
       const r = await fetch(`${MISTRAL}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: CHAT_MODEL, temperature: 0, response_format: { type: "json_object" },
-          messages: [{ role: "user", content: extractPrompt(ctx, pages) }],
-        }),
+        body: JSON.stringify({ model: CHAT_MODEL, temperature: 0, response_format: { type: "json_object" },
+          messages: [{ role: "user", content: extractPrompt(ctx, pages) }] }),
       });
       if (!r.ok) return json({ error: `Mistral failed (${r.status}): ${(await r.text()).slice(0, 300)}` }, 502);
       const out = await r.json();
       const text = out.choices?.[0]?.message?.content ?? "";
-      let result: any;
-      try { result = JSON.parse(text); } catch {
-        const m = String(text).match(/\{[\s\S]*\}/); result = m ? JSON.parse(m[0]) : null;
-      }
+      let result: any = null;
+      try { result = JSON.parse(text); } catch { const m = String(text).match(/\{[\s\S]*\}/); if (m) try { result = JSON.parse(m[0]); } catch { /* fallthrough */ } }
       if (!result || !result.pl) return json({ error: "The figures could not be read from the answer. Try again." }, 502);
       result.adjustments = (result.adjustments || []).filter((a: any) => a && ADJ_KEYS.includes(a.key));
       return json({ result, model: out.model });
@@ -134,6 +190,6 @@ Deno.serve(async (req) => {
 
     return json({ error: "Unknown action." }, 400);
   } catch (e) {
-    return json({ error: "Something went wrong: " + String((e as Error)?.message || e).slice(0, 200) }, 500);
+    return json({ error: "Something went wrong: " + String((e as any)?.message || e).slice(0, 200) }, 500);
   }
 });

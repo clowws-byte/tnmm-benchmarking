@@ -185,13 +185,19 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
 .autherr{color:var(--bad);font-size:13px;min-height:1em}
 .who{display:flex;align-items:center;gap:8px;color:#cfe0f2;font-size:13px}
 [hidden]{display:none!important}
+a.btn{text-decoration:none;justify-content:center}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script>
   window.TNMM_CONFIG = {
-    url: 'https://fqxxrqjrbhrifybzxvly.supabase.co',
-    key: 'sb_publishable_seZcZb_POYUZWVl_2J7EtA_zsutTEn0'
+    // CCTaxLab portal: staff sign in there; same address, so the sign-in is shared
+    portalUrl: 'https://clowws-byte.github.io/cctaxlab/',
+    cctUrl: 'https://orszbsqshrzhjgtlihzc.supabase.co',
+    cctKey: 'sb_publishable_by4wqCu53U9son8u0kp1qA_Uij0ysHW',
+    // Transfer Pricing project: jobs and Mistral OCR
+    apiUrl: 'https://fqxxrqjrbhrifybzxvly.supabase.co/functions/v1/tnmm-api',
+    apiKey: 'sb_publishable_seZcZb_POYUZWVl_2J7EtA_zsutTEn0'
   };
 </script>
 </head>
@@ -201,8 +207,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
   <div class="spacer"></div>
   <span class="save" id="save" aria-live="polite"></span>
   <div class="who" id="who" hidden><span id="whoname"></span>
-    <button class="btn sm" id="adminbtn" data-act="admin" hidden>Users</button>
-    <button class="btn sm" data-act="signout">Sign out</button></div>
+    <a class="btn sm" href="https://clowws-byte.github.io/cctaxlab/">CCTaxLab</a></div>
   <button class="btn primary" id="dl" data-act="download" hidden>Download Excel</button>
 </header>
 <div id="authview"><p class="empty">Loading…</p></div>
@@ -586,8 +591,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     saving = true; setSave('Saving…');
     try {
       const body = JSON.parse(JSON.stringify(job));
-      const { error } = await state.sb.from('tnmm_jobs').upsert({ id: job.id, owner: state.user.id, title: job.title || '', job: body, updated_at: new Date(job.updatedAt).toISOString() });
-      if (error) throw error;
+      await api('save', { id: job.id, title: job.title || '', job: body });
       const i = state.jobs.findIndex(x => x.id === job.id); if (i >= 0) state.jobs[i] = JSON.parse(JSON.stringify(job)); else state.jobs.unshift(JSON.parse(JSON.stringify(job)));
       renderRail();
       setSave('All changes saved');
@@ -602,108 +606,67 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
   function localLoad() { try { return Object.values(JSON.parse(localStorage.getItem('tnmm-jobs') || '{}')); } catch (e) { return []; } }
   function setSave(t, err) { const el = $('#save'); if (el) { el.textContent = t; el.classList.toggle('err', !!err); } }
 
-  /* ---------------- sign-in, approval and admin ---------------- */
+  /* ---------------- sign-in through CCTaxLab ---------------- */
+  // The CCTaxLab portal and this app share the address clowws-byte.github.io, so the portal's
+  // stored sign-in is read here. The TNMM server re-checks it with CCTaxLab on every call.
   async function initAuth() {
     const cfg = window.TNMM_CONFIG;
-    if (!window.supabase) { showAuth('signin', 'The sign-in service could not load. Check your connection and refresh.'); return; }
-    state.sb = window.supabase.createClient(cfg.url, cfg.key, { auth: { persistSession: true, autoRefreshToken: true } });
+    if (!window.supabase) { showAuth('The sign-in service could not load. Check your connection and refresh.'); return; }
+    state.sb = window.supabase.createClient(cfg.cctUrl, cfg.cctKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } });
     const { data } = await state.sb.auth.getSession();
     await onSession(data.session);
     state.sb.auth.onAuthStateChange((ev, session) => {
       if (ev === 'SIGNED_OUT' || (ev === 'SIGNED_IN' && (!state.user || state.user.id !== (session && session.user.id)))) onSession(session);
     });
   }
+  async function api(action, body, opts = {}) {
+    const { data: sess } = await state.sb.auth.getSession();
+    const token = sess.session && sess.session.access_token;
+    const raw = body instanceof Blob;
+    const r = await fetch(window.TNMM_CONFIG.apiUrl + '?action=' + action, {
+      method: 'POST', signal: opts.signal,
+      headers: { Authorization: 'Bearer ' + (token || ''), apikey: window.TNMM_CONFIG.apiKey, 'Content-Type': raw ? body.type : 'application/json' },
+      body: raw ? body : JSON.stringify(body || {})
+    });
+    const out = await r.json().catch(() => ({}));
+    if (r.status === 401) { onSession(null); }
+    if (!r.ok) throw new Error(out.error || ('Request failed (' + r.status + ')'));
+    return out;
+  }
   async function onSession(session) {
     state.user = session ? session.user : null; state.profile = null;
-    if (!state.user) return showAuth('signin');
-    const { data: prof } = await state.sb.from('tp_profiles').select('*').eq('id', state.user.id).maybeSingle();
-    state.profile = prof;
-    if (!prof || prof.status !== 'approved') return showPending(prof);
+    if (!state.user) return showAuth();
+    let me;
+    try { me = await api('me'); } catch (e) { return showAuth('The TNMM server could not be reached. Refresh to try again.'); }
+    if (!me.ok) return me.reason === 'signin' ? showAuth() : showNoAccess(me.reason);
+    state.profile = me.profile;
     showApp();
-    const { data: rows, error } = await state.sb.from('tnmm_jobs').select('id,title,job,updated_at').eq('owner', state.user.id).order('updated_at', { ascending: false });
-    if (error) { setSave('Saved jobs could not be loaded', true); onJobsLoaded([]); return; }
-    onJobsLoaded((rows || []).map(r => { const j = T.normaliseJob(r.job || {}); j.id = r.id; j.title = r.title || j.title; j.updatedAt = Date.parse(r.updated_at) || j.updatedAt; return j; }));
+    try {
+      const out = await api('list');
+      onJobsLoaded((out.jobs || []).map(r => { const j = T.normaliseJob(r.job || {}); j.id = r.id; j.title = r.title || j.title; j.updatedAt = Date.parse(r.updated_at) || j.updatedAt; return j; }));
+    } catch (e) { setSave('Saved jobs could not be loaded', true); onJobsLoaded([]); }
   }
   function showApp() {
     $('#authview').hidden = true; $('.shell').hidden = false; $('#dl').hidden = false; $('#who').hidden = false;
-    $('#whoname').textContent = (state.profile.full_name || state.profile.email);
-    $('#adminbtn').hidden = state.profile.role !== 'admin';
+    $('#whoname').textContent = state.profile.name || state.profile.email || '';
     render();
   }
   function hideApp() { $('.shell').hidden = true; $('#dl').hidden = true; $('#who').hidden = true; $('#authview').hidden = false; }
-  function showAuth(mode, msg) {
+  function showAuth(msg) {
     hideApp();
-    const signup = mode === 'signup';
-    $('#authview').innerHTML = `<form class="authbox" id="authform" novalidate>
-      <h1>${signup ? 'Request access' : 'Sign in'}</h1>
-      <p class="meta">${signup ? 'An admin approves new accounts before they can be used.' : 'Transfer Pricing · TNMM Benchmarking'}</p>
-      ${signup ? `<div class="field"><label for="a-name">Full name</label><input id="a-name" autocomplete="name" required></div>` : ''}
-      <div class="field"><label for="a-email">Email</label><input id="a-email" type="email" autocomplete="email" required></div>
-      <div class="field"><label for="a-pass">Password</label><input id="a-pass" type="password" autocomplete="${signup ? 'new-password' : 'current-password'}" minlength="8" required></div>
-      <p class="autherr" id="autherr" role="alert">${esc(msg || '')}</p>
-      <button class="btn primary" type="submit">${signup ? 'Request access' : 'Sign in'}</button>
-      <button class="btn ghost" type="button" data-auth="${signup ? 'signin' : 'signup'}">${signup ? 'I already have an account' : 'Request access'}</button>
-    </form>`;
-    $('#authform').addEventListener('submit', async ev => {
-      ev.preventDefault();
-      const email = $('#a-email').value.trim().toLowerCase(), password = $('#a-pass').value;
-      const err = $('#autherr'); err.textContent = '';
-      if (!email || password.length < 8) { err.textContent = 'Enter your email and a password of at least 8 characters.'; return; }
-      if (signup) {
-        const name = $('#a-name').value.trim();
-        if (!name) { err.textContent = 'Enter your full name.'; return; }
-        const { data, error } = await state.sb.auth.signUp({ email, password, options: { data: { full_name: name } } });
-        if (error) { err.textContent = error.message; return; }
-        if (!data.session) { showAuth('signin', 'Request sent. Once an admin approves it, sign in here. If asked, confirm your email first.'); return; }
-        onSession(data.session);
-      } else {
-        const { data, error } = await state.sb.auth.signInWithPassword({ email, password });
-        if (error) { err.textContent = error.message === 'Invalid login credentials' ? 'That email and password do not match.' : error.message; return; }
-        onSession(data.session);
-      }
-    });
-    $('#a-email').focus();
+    $('#authview').innerHTML = `<div class="authbox"><h1>Sign in through CCTaxLab</h1>
+      <p>TNMM Benchmarking uses your CCTaxLab account. Sign in to the portal, then open TNMM Benchmarking from your applications.</p>
+      <p class="autherr" role="alert">${esc(msg || '')}</p>
+      <a class="btn primary" href="${esc(window.TNMM_CONFIG.portalUrl)}">Go to CCTaxLab</a>
+      <button class="btn ghost" data-act="recheck">I've signed in, check again</button></div>`;
   }
-  function showPending(prof) {
+  function showNoAccess(reason) {
     hideApp();
-    const susp = prof && prof.status === 'suspended';
-    $('#authview').innerHTML = `<div class="authbox"><h1>${susp ? 'Account suspended' : 'Waiting for approval'}</h1>
-      <p>${susp ? 'Your access has been suspended. Contact your admin.' : 'Your request has been received. An admin needs to approve your account before you can use the app.'}</p>
-      <p class="meta">${esc(state.user.email)}</p>
-      <button class="btn" data-act="recheck">Check again</button><button class="btn ghost" data-act="signout">Sign out</button></div>`;
-  }
-  async function openAdmin() {
-    const { data: users, error } = await state.sb.from('tp_profiles').select('*').order('created_at', { ascending: true });
-    const { data: pre } = await state.sb.from('tp_preapproved').select('*').order('email');
-    if (error) return toast('Could not load users: ' + error.message);
-    const m = document.createElement('div'); m.className = 'modal';
-    const row = u => `<tr><td><b>${esc(u.full_name || '–')}</b><br><small class="meta">${esc(u.email)}</small></td>
-      <td>${u.role === 'admin' ? 'Admin' : 'Staff'}</td><td>${u.status === 'approved' ? '<span class="chip good">Approved</span>' : u.status === 'pending' ? '<span class="chip warn">Pending</span>' : '<span class="chip bad">Suspended</span>'}</td>
-      <td class="acts">${u.id === state.user.id ? '<small class="meta">You</small>' : `
-        ${u.status !== 'approved' ? `<button class="btn sm primary" data-u="${u.id}" data-set='{"status":"approved"}'>Approve</button>` : `<button class="btn sm" data-u="${u.id}" data-set='{"status":"suspended"}'>Suspend</button>`}
-        ${u.role === 'admin' ? `<button class="btn sm" data-u="${u.id}" data-set='{"role":"staff"}'>Make staff</button>` : `<button class="btn sm" data-u="${u.id}" data-set='{"role":"admin"}'>Make admin</button>`}`}</td></tr>`;
-    m.innerHTML = `<div class="box" role="dialog" aria-modal="true" style="max-width:760px;max-height:88vh;overflow:auto">
-      <div class="row" style="justify-content:space-between"><h3>Users</h3><button class="btn sm" data-x="no">Close</button></div>
-      <table class="r"><thead><tr><th>Name</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>${(users || []).map(row).join('')}</tbody></table>
-      <h3>Pre-approved emails</h3><p class="meta" style="margin:0">People who sign up with these emails are approved straight away.</p>
-      <ul class="notes">${(pre || []).map(p => `<li>${esc(p.email)} (${p.role})</li>`).join('') || '<li>None</li>'}</ul>
-      <form class="row" id="preform"><input id="pre-email" type="email" placeholder="name@company.com" style="border:1px solid var(--line);border-radius:6px;padding:6px 8px;flex:1"><select id="pre-role" style="border:1px solid var(--line);border-radius:6px;padding:6px"><option value="staff">Staff</option><option value="admin">Admin</option></select><button class="btn sm primary" type="submit">Add</button></form>
-    </div>`;
-    document.body.appendChild(m);
-    m.addEventListener('click', async ev => {
-      if (ev.target.dataset.x === 'no' || ev.target === m) return m.remove();
-      const b = ev.target.closest('[data-u]'); if (!b) return;
-      const { error: e2 } = await state.sb.from('tp_profiles').update(JSON.parse(b.dataset.set)).eq('id', b.dataset.u);
-      if (e2) return toast('Could not update: ' + e2.message);
-      m.remove(); openAdmin();
-    });
-    $('#preform', m).addEventListener('submit', async ev => {
-      ev.preventDefault();
-      const email = $('#pre-email', m).value.trim().toLowerCase(); if (!email) return;
-      const { error: e3 } = await state.sb.from('tp_preapproved').upsert({ email, role: $('#pre-role', m).value });
-      if (e3) return toast('Could not add: ' + e3.message);
-      m.remove(); openAdmin();
-    });
+    $('#authview').innerHTML = `<div class="authbox"><h1>${reason === 'not_approved' ? 'Account not approved' : 'No access yet'}</h1>
+      <p>${reason === 'not_approved' ? 'Your CCTaxLab account is waiting for approval.' : 'Your CCTaxLab account does not have access to TNMM Benchmarking. Ask an admin to grant it in CCTaxLab → Admin → Access.'}</p>
+      <p class="meta">${esc(state.user && state.user.email)}</p>
+      <a class="btn" href="${esc(window.TNMM_CONFIG.portalUrl)}">Back to CCTaxLab</a>
+      <button class="btn ghost" data-act="recheck">Check again</button></div>`;
   }
   let firstLoad = true;
   function onJobsLoaded(jobs) {
@@ -744,8 +707,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     const j = state.job; if (!j || state.isExample) return;
     confirmBox('Delete this job?', `“${esc(j.title)}” and its figures will be removed. Uploaded PDFs are never stored, so nothing else is affected.`, 'Delete job', async () => {
       state.jobs = state.jobs.filter(x => x.id !== j.id);
-      const { error } = await state.sb.from('tnmm_jobs').delete().eq('id', j.id);
-      if (error) toast('Could not delete the job: ' + error.message);
+      try { await api('delete', { id: j.id }); } catch (e) { toast('Could not delete the job: ' + e.message); }
       if (state.jobs.length) openJob(state.jobs[0].id); else openExample();
     });
   }
@@ -966,9 +928,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     if (b.dataset.basis) { state.job.basis = b.dataset.basis; touch(); return render(); }
     const act = b.dataset.act; if (!act) return;
     const id = b.dataset.id;
-    if (act === 'signout') { await state.sb.auth.signOut(); return; }
     if (act === 'recheck') { const { data } = await state.sb.auth.getSession(); return onSession(data.session); }
-    if (act === 'admin') return openAdmin();
     if (act === 'new') return newJob();
     if (act === 'dup') return duplicateJob();
     if (act === 'del') return deleteJob();
@@ -997,7 +957,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
   function onFile(id, fileList) {
     const f = (fileList || [])[0]; if (!f) return;
     if (!/^(application\/pdf|image\/(png|jpeg|webp))$/.test(f.type)) return toast('Upload a PDF or a PNG/JPEG page image.');
-    if (f.size > 50 * 1048576) return toast('That file is over 50 MB. Split it or upload only the financial statements.');
+    if (f.size > 20 * 1048576) return toast('That file is over 20 MB. Upload only the financial statements pages.');
     state.files[id] = { file: f, name: f.name, size: f.size };
     delete state.ocr[id];
     const c = findCo(id); c.source = { file: f.name }; touch(); render();
@@ -1020,18 +980,6 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     if (/statements? of (changes in equity|cash flows)/.test(t) && s < 10) s -= 3;
     return s;
   }
-  async function callFn(body, signal) {
-    const { data: sess } = await state.sb.auth.getSession();
-    const token = sess.session && sess.session.access_token;
-    const r = await fetch(window.TNMM_CONFIG.url + '/functions/v1/tnmm-ocr', {
-      method: 'POST', signal,
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token, apikey: window.TNMM_CONFIG.key },
-      body: JSON.stringify(body)
-    });
-    const out = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(out.error || ('Request failed (' + r.status + ')'));
-    return out;
-  }
   async function extract(id) {
     const job = state.job, c = findCo(id), f = state.files[id];
     if (!c || !f || state.busy[id]) return;
@@ -1039,13 +987,8 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     try {
       let pages = state.ocr[id] ? state.ocr[id].pages : null;
       if (!pages) {
-        setBusy(id, 'Uploading the accounts…', 0.1);
-        const ext = f.file.type === 'application/pdf' ? 'pdf' : f.file.type.split('/')[1];
-        const path = state.user.id + '/' + crypto.randomUUID() + '.' + ext;
-        const up = await state.sb.storage.from('tnmm-uploads').upload(path, f.file, { contentType: f.file.type, upsert: false });
-        if (up.error) throw new Error('Upload failed: ' + up.error.message);
-        setBusy(id, 'Running OCR on every page. Large scans can take a minute…', 0.3);
-        const o = await callFn({ action: 'ocr', path }, ctl.signal);
+        setBusy(id, 'Uploading and running OCR on every page. Large scans can take a minute…', 0.25);
+        const o = await api('ocr', f.file, { signal: ctl.signal });
         pages = o.pages || [];
         if (!pages.length) throw new Error('OCR returned no text. Check the file is the audited accounts.');
         state.ocr[id] = { file: f.name, pages };
@@ -1054,7 +997,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
       const pick = (ranked.length ? ranked : pages.slice(0, 14)).sort((a, b) => a.index - b.index);
       setBusy(id, `Mapping figures from page${pick.length === 1 ? '' : 's'} ${pick.map(p => p.index + 1).join(', ')}…`, 0.65);
       const win = job.windowFrom && job.windowTo ? `between ${T.fmtMonth(job.windowFrom)} and ${T.fmtMonth(job.windowTo)}` : '';
-      const out = await callFn({ action: 'extract', pages: pick, role: c.isTested ? 'tested' : 'comparable', fye: job.tp.fye, window: win }, ctl.signal);
+      const out = await api('extract', { pages: pick, role: c.isTested ? 'tested' : 'comparable', fye: job.tp.fye, window: win }, { signal: ctl.signal });
       applyExtraction(c, out.result, pick.map(p => p.index + 1));
       toast(`${c.name || 'Company'}: figures read. Please check them against the accounts.`);
     } catch (e) {

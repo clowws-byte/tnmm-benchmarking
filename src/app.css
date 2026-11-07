@@ -177,3 +177,4 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
 .autherr{color:var(--bad);font-size:13px;min-height:1em}
 .who{display:flex;align-items:center;gap:8px;color:#cfe0f2;font-size:13px}
 [hidden]{display:none!important}
+a.btn{text-decoration:none;justify-content:center}
