@@ -520,14 +520,35 @@
       document.head.appendChild(el);
     }));
   }
-  let tessP = null;
-  function tessWorker() {
-    return tessP || (tessP = (async () => {
+  // A small pool of free OCR workers (2-3, by CPU) so several pages are read at the same time.
+  let poolP = null;
+  function tessPool() {
+    return poolP || (poolP = (async () => {
       await loadScript(LIB.tess);
-      const w = await window.Tesseract.createWorker('eng');
-      await w.setParameters({ preserve_interword_spaces: '1' });
-      return w;
-    })().catch(e => { tessP = null; throw e; }));
+      const n = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 2) / 2)));
+      const ws = await Promise.all(Array.from({ length: n }, async () => {
+        const w = await window.Tesseract.createWorker('eng');
+        await w.setParameters({ preserve_interword_spaces: '1' });
+        return w;
+      }));
+      const idle = [...ws], waiting = [];
+      return {
+        size: n,
+        async run(fn) {
+          const w = idle.pop() || await new Promise(r => waiting.push(r));
+          try { return await fn(w); } finally { const nx = waiting.shift(); if (nx) nx(w); else idle.push(w); }
+        }
+      };
+    })().catch(e => { poolP = null; throw e; }));
+  }
+  async function ocrPage(doc, i, scale, w) {
+    const page = await doc.getPage(i + 1);
+    const vp = page.getViewport({ scale });
+    const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+    await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+    const { data } = await w.recognize(cv);
+    cv.width = cv.height = 0; page.cleanup();
+    return data;
   }
   function goodText(t) {
     const s = String(t || '').replace(/\s/g, '');
@@ -556,13 +577,43 @@
       return out;
     }).join('\n');
   }
+  /* Text already read from a file is kept in this browser for 3 days (keyed by the file's fingerprint),
+     so reading the same file again, even after a refresh, is instant and free. */
+  const IDB = { db: null };
+  function idb() {
+    return IDB.db || (IDB.db = new Promise((res, rej) => {
+      const r = indexedDB.open('tnmm-reads', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('pages');
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    }));
+  }
+  async function cacheGet(key) {
+    try {
+      const db = await idb();
+      const v = await new Promise((res, rej) => { const q = db.transaction('pages').objectStore('pages').get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      return v && Date.now() - v.at < 3 * 86400000 ? v.pages : null;
+    } catch (e) { return null; }
+  }
+  async function cachePut(key, pages) {
+    try {
+      const db = await idb();
+      const tx = db.transaction('pages', 'readwrite'), st = tx.objectStore('pages');
+      st.put({ at: Date.now(), pages }, key);
+      const all = st.openCursor(); // drop entries older than 3 days
+      all.onsuccess = () => { const c = all.result; if (!c) return; if (Date.now() - (c.value.at || 0) > 3 * 86400000) c.delete(); c.continue(); };
+    } catch (e) { /* storage not available: just skip the cache */ }
+  }
+  async function fileKey(file) {
+    const buf = await file.arrayBuffer();
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
+  }
   const stopIf = signal => { if (signal.aborted) throw new DOMException('Stopped', 'AbortError'); };
   async function browserRead(file, mime, id, signal) {
     try {
       if (mime.startsWith('image/')) {
         setBusy(id, 'Free OCR on the image…', 0.2);
-        const w = await tessWorker(); stopIf(signal);
-        const { data } = await w.recognize(file);
+        const pool = await tessPool(); stopIf(signal);
+        const data = await pool.run(async w => (await w.recognize(file)).data);
         if (data.confidence >= 55 && goodText(data.text)) return [{ index: 0, markdown: data.text }];
         state.why[id] = `image too unclear for free OCR (confidence ${Math.round(data.confidence)}%)`; return null;
       }
@@ -584,23 +635,30 @@
       // digital text already has the profit or loss statement: no need to OCR the odd scanned page (e.g. signatures)
       const hasPL = pages.some(p => scorePage(p.markdown, p.index) >= 10);
       if (scanned.length && !hasPL) {
-        const todo = scanned.slice(0, 80);
-        setBusy(id, `Scanned pages found. Loading free OCR…`, 0.2);
-        const w = await tessWorker();
-        let conf = 0, good = 0;
-        for (let k = 0; k < todo.length; k++) {
+        /* Scanned: two passes so only the pages that matter get the slow, sharp OCR.
+           Pass 1 reads every scanned page quickly at low resolution just to find the statements and notes.
+           Pass 2 reads the top pages again at high resolution. */
+        const todo = scanned.slice(0, 120), t0 = Date.now();
+        setBusy(id, 'Scanned PDF. Loading free OCR…', 0.2);
+        const pool = await tessPool();
+        const quick = {}; let done = 0;
+        await Promise.all(todo.map(i => pool.run(async w => {
           stopIf(signal);
-          setBusy(id, `Free OCR on scanned page ${k + 1} of ${todo.length} (a few seconds each)…`, 0.2 + 0.4 * k / todo.length);
-          const page = await doc.getPage(todo[k] + 1);
-          const vp = page.getViewport({ scale: 2 });
-          const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
-          await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
-          const { data } = await w.recognize(cv);
-          cv.width = cv.height = 0;
-          if (goodText(data.text)) { pages.push({ index: todo[k], markdown: data.text }); conf += data.confidence || 0; good++; }
-          else if (goodText(layer[todo[k]])) pages.push({ index: todo[k], markdown: layer[todo[k]] });
-        }
+          quick[i] = (await ocrPage(doc, i, 1.5, w)).text || '';
+          done++; setBusy(id, `Free OCR, finding the statements: page ${done} of ${todo.length} (${Math.round((Date.now() - t0) / 1000)}s)…`, 0.2 + 0.2 * done / todo.length);
+        })));
+        const ranked = todo.map(i => ({ i, s: scorePage(quick[i], i) })).sort((a, b) => b.s - a.s);
+        const found = ranked[0] && ranked[0].s >= 5;
+        const sharp = found ? ranked.filter(x => x.s > 0).slice(0, 12).map(x => x.i) : todo.slice(0, 40);
+        let conf = 0, good = 0; done = 0;
+        await Promise.all(sharp.map(i => pool.run(async w => {
+          stopIf(signal);
+          const d = await ocrPage(doc, i, 2, w);
+          if (goodText(d.text)) { quick[i] = d.text; conf += d.confidence || 0; good++; }
+          done++; setBusy(id, `Free OCR, reading the statements: page ${done} of ${sharp.length} (${Math.round((Date.now() - t0) / 1000)}s)…`, 0.4 + 0.2 * done / sharp.length);
+        })));
         if (!good || conf / good < 50) { state.why[id] = good ? `scan too unclear for free OCR (confidence ${Math.round(conf / good)}%)` : 'no readable text found on the scanned pages'; return null; }
+        todo.forEach(i => { const t = goodText(quick[i]) ? quick[i] : layer[i]; if (goodText(t)) pages.push({ index: i, markdown: t }); });
         pages.sort((a, b) => a.index - b.index);
       }
       // P&L found in the digital text: keep any short pages' own text too (covers, headings)
@@ -645,6 +703,8 @@
     const ctl = new AbortController(); state.aborts[id] = ctl;
     try {
       let pages = state.ocr[id] ? state.ocr[id].pages : null;
+      const key = pages ? null : await fileKey(f.file).catch(() => null);
+      if (!pages && key) { pages = await cacheGet(key); if (pages) { setBusy(id, 'Already read on this computer. Using the saved text…', 0.6); state.ocr[id] = { file: f.name, pages }; } }
       if (!pages) {
         const fm = fileMode(f.file);
         if (fm.mode === 'ocr' && (fm.mime === 'application/pdf' || fm.mime.startsWith('image/'))) {
@@ -659,6 +719,7 @@
         }
         if (!pages.length) throw new Error('OCR returned no text. Check the file is the audited accounts.');
         state.ocr[id] = { file: f.name, pages };
+        if (key) cachePut(key, pages);
       }
       const ranked = pages.map((p, i) => ({ p, s: scorePage(p.markdown, i) })).filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 14).map(x => x.p);
       const pick = (ranked.length ? ranked : pages.slice(0, 14)).sort((a, b) => a.index - b.index);
