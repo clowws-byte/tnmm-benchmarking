@@ -12,6 +12,8 @@ const MISTRAL = "https://api.mistral.ai/v1";
 const OCR_MODEL = Deno.env.get("MISTRAL_OCR_MODEL") ?? "mistral-ocr-latest";
 const CHAT_MODEL = Deno.env.get("MISTRAL_CHAT_MODEL") ?? "mistral-large-latest";
 const MAX_FILE = 20 * 1024 * 1024;
+// PDFs, Word, PowerPoint and images go to Mistral OCR; spreadsheets and text are read in the browser.
+const OCR_TYPES = /^(application\/pdf|image\/(png|jpeg|webp|gif|avif)|application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|presentationml\.presentation))$/;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -51,14 +53,14 @@ function b64(bytes: Uint8Array): string {
 const ADJ_KEYS = ["less_interest", "less_dividend", "adj_invest_disposal", "adj_invest_fv", "less_rental_nonop",
   "adj_nontrade_forex", "less_exceptional_income", "add_exceptional_expense"];
 
-function extractPrompt(ctx: { role: string; fye?: string; window?: string }, pages: { index: number; markdown: string }[]) {
+function extractPrompt(ctx: { role: string; fye?: string; window?: string; kind?: string }, pages: { index: number; markdown: string }[]) {
   const target = ctx.role === "tested"
     ? `This is the TESTED PARTY. Use the financial year ending ${ctx.fye || "shown as the current year"}.`
     : `This is a COMPARABLE company. Use the financial year whose year end falls ${ctx.window || "closest to the tested party year end"}. If both columns qualify, use the more recent one.`;
   const body = pages.map(p => `=== PAGE ${p.index + 1} ===\n${p.markdown}`).join("\n\n");
-  return `You are a Malaysian transfer pricing analyst preparing a TNMM benchmarking. Below is OCR text (Markdown) of pages from one company's audited financial statements. ${target}
+  return `You are a Malaysian transfer pricing analyst preparing a TNMM benchmarking. Below is text (Markdown) from one company's ${ctx.kind === "management" ? "management accounts" : "financial statements (audited accounts or management accounts)"}. ${target}
 
-Read every figure exactly from the text. Do not estimate. Check: gross profit = revenue + cost of sales, and your computed PBT must equal the PBT shown in the statement of profit or loss.
+Read every figure exactly from the text. Do not estimate. If the text is management accounts with different line names, map each line to the closest key below and say so in warnings. Check: gross profit = revenue + cost of sales, and your computed PBT must equal the PBT shown in the statement of profit or loss.
 
 1. Statement of profit or loss, signed: income positive, expenses and losses negative, figures in full ringgit (multiply by 1000 if presented in RM'000). Keys:
 - rev: revenue; cos: cost of sales
@@ -149,13 +151,13 @@ Deno.serve(async (req) => {
     if (action === "ocr") {
       // the file arrives as the raw request body and is never stored
       const mime = (req.headers.get("Content-Type") || "").split(";")[0].trim();
-      if (!/^(application\/pdf|image\/(png|jpeg|webp))$/.test(mime)) return json({ error: "Upload a PDF or a PNG/JPEG image." }, 415);
+      if (!OCR_TYPES.test(mime)) return json({ error: "This file type cannot be read. Use PDF, Word, PowerPoint, an image, Excel or CSV." }, 415);
       const bytes = new Uint8Array(await req.arrayBuffer());
       if (!bytes.length) return json({ error: "The file was empty." }, 400);
       if (bytes.length > MAX_FILE) return json({ error: "The file is over 20 MB. Upload only the financial statements pages." }, 413);
-      const document = mime === "application/pdf"
-        ? { type: "document_url", document_url: `data:application/pdf;base64,${b64(bytes)}` }
-        : { type: "image_url", image_url: `data:${mime};base64,${b64(bytes)}` };
+      const document = mime.startsWith("image/")
+        ? { type: "image_url", image_url: `data:${mime};base64,${b64(bytes)}` }
+        : { type: "document_url", document_url: `data:${mime};base64,${b64(bytes)}` };
       const r = await fetch(`${MISTRAL}/ocr`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
@@ -171,7 +173,7 @@ Deno.serve(async (req) => {
       const pages = (Array.isArray(b.pages) ? b.pages : []).slice(0, 30)
         .map((p: any) => ({ index: Number(p.index) || 0, markdown: String(p.markdown || "").slice(0, 40000) }));
       if (!pages.length) return json({ error: "No pages were sent." }, 400);
-      const ctx = { role: b.role === "tested" ? "tested" : "comparable", fye: String(b.fye || ""), window: String(b.window || "") };
+      const ctx = { role: b.role === "tested" ? "tested" : "comparable", fye: String(b.fye || ""), window: String(b.window || ""), kind: b.kind === "management" ? "management" : "any" };
       const r = await fetch(`${MISTRAL}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
