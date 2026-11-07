@@ -49,6 +49,23 @@ async function identify(token: string) {
    The browser uploads the file straight to private Storage (tnmm-uploads/<user>/<run>); Mistral reads it
    through a 10-minute signed link, and the file is deleted as soon as OCR finishes. */
 const BUCKET = "tnmm-uploads";
+/* Call Mistral, waiting and retrying when it answers 429 (rate limited) or 5xx. A rejected call is not billed. */
+async function mistralFetch(url: string, init: RequestInit, tries = 4) {
+  let wait = 4000;
+  for (let i = 1; ; i++) {
+    const r = await fetch(url, init);
+    if ((r.status !== 429 && r.status < 500) || i >= tries) return r;
+    const ra = Number(r.headers.get("retry-after"));
+    await r.body?.cancel();
+    await new Promise(res => setTimeout(res, ra > 0 ? Math.min(ra * 1000, 30000) : wait));
+    wait *= 2;
+  }
+}
+function mistralError(what: string, status: number, text: string) {
+  if (status === 429) return `Mistral is refusing requests on your API key (rate limit). Check the key's limits and billing in the Mistral console (Workspace > Limits / Billing), then try again.`;
+  if (status === 401) return "Mistral rejected the API key. Check MISTRAL_API_KEY in Supabase Edge Function secrets.";
+  return `${what} failed (${status}): ${text.slice(0, 200)}`;
+}
 async function runOcr(db: any, runId: string, path: string, mime: string, key: string) {
   const t0 = Date.now();
   try {
@@ -58,11 +75,11 @@ async function runOcr(db: any, runId: string, path: string, mime: string, key: s
       ? { type: "image_url", image_url: signed.signedUrl }
       : { type: "document_url", document_url: signed.signedUrl };
     console.log(`ocr ${runId}: calling Mistral`);
-    const r = await fetch(`${MISTRAL}/ocr`, {
+    const r = await mistralFetch(`${MISTRAL}/ocr`, {
       method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: OCR_MODEL, document, include_image_base64: false }),
     });
-    if (!r.ok) throw new Error(`Mistral OCR failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
+    if (!r.ok) throw new Error(mistralError("Mistral OCR", r.status, await r.text()));
     const out = await r.json();
     const pages = (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") }));
     if (!pages.length) throw new Error("OCR returned no text. Check the file is the accounts.");
@@ -235,13 +252,13 @@ Deno.serve(async (req) => {
         .map((p: any) => ({ index: Number(p.index) || 0, markdown: String(p.markdown || "").slice(0, 40000) }));
       if (!pages.length) return json({ error: "No pages were sent." }, 400);
       const ctx = { role: b.role === "tested" ? "tested" : "comparable", fye: String(b.fye || ""), window: String(b.window || ""), kind: b.kind === "management" ? "management" : "any" };
-      const r = await fetch(`${MISTRAL}/chat/completions`, {
+      const r = await mistralFetch(`${MISTRAL}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body: JSON.stringify({ model: CHAT_MODEL, temperature: 0, response_format: { type: "json_object" },
           messages: [{ role: "user", content: extractPrompt(ctx, pages) }] }),
       });
-      if (!r.ok) return json({ error: `Mistral failed (${r.status}): ${(await r.text()).slice(0, 300)}` }, 502);
+      if (!r.ok) return json({ error: mistralError("Reading the figures", r.status, await r.text()) }, 502);
       const out = await r.json();
       const text = out.choices?.[0]?.message?.content ?? "";
       let result: any = null;
