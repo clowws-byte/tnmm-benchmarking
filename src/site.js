@@ -502,6 +502,133 @@
       x.send(blob);
     });
   }
+
+  /* ---------- Free reading in the browser ----------
+     1) Digital PDFs: read the text layer with pdf.js (exact, instant, free).
+     2) Scanned pages / images: free OCR with Tesseract.js, in the browser.
+     Returns null when the result looks too poor, so the caller can fall back to Mistral OCR. */
+  const LIB = {
+    pdf: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+    pdfWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+    tess: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js'
+  };
+  const scripts = {};
+  function loadScript(src) {
+    return scripts[src] || (scripts[src] = new Promise((res, rej) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = res; el.onerror = () => { delete scripts[src]; rej(new Error('Could not load ' + src)); };
+      document.head.appendChild(el);
+    }));
+  }
+  let tessP = null;
+  function tessWorker() {
+    return tessP || (tessP = (async () => {
+      await loadScript(LIB.tess);
+      const w = await window.Tesseract.createWorker('eng');
+      await w.setParameters({ preserve_interword_spaces: '1' });
+      return w;
+    })().catch(e => { tessP = null; throw e; }));
+  }
+  function goodText(t) {
+    const s = String(t || '').replace(/\s/g, '');
+    if (s.length < 60) return false;
+    const ok = (s.match(/[A-Za-z0-9.,()%\-'&:\/]/g) || []).length;
+    return ok / s.length > 0.85;
+  }
+  // rebuild lines (and keep column gaps) from pdf.js text items
+  function linesFromItems(items) {
+    const rows = [];
+    for (const it of items) {
+      if (!it.str || !it.str.trim()) continue;
+      const x = it.transform[4], y = it.transform[5], h = Math.abs(it.transform[3]) || 8;
+      let r = rows.find(r => Math.abs(r.y - y) < Math.max(r.h, h) * 0.5);
+      if (!r) { r = { y, h, items: [] }; rows.push(r); }
+      r.items.push({ x, w: it.width || 0, s: it.str });
+    }
+    rows.sort((a, b) => b.y - a.y);
+    return rows.map(r => {
+      r.items.sort((a, b) => a.x - b.x);
+      let out = '', end = null;
+      for (const t of r.items) {
+        if (end !== null) { const gap = t.x - end; out += gap > r.h * 1.2 ? '    ' : gap > r.h * 0.15 ? ' ' : ''; }
+        out += t.s; end = t.x + t.w;
+      }
+      return out;
+    }).join('\n');
+  }
+  const stopIf = signal => { if (signal.aborted) throw new DOMException('Stopped', 'AbortError'); };
+  async function browserRead(file, mime, id, signal) {
+    try {
+      if (mime.startsWith('image/')) {
+        setBusy(id, 'Free OCR on the image…', 0.2);
+        const w = await tessWorker(); stopIf(signal);
+        const { data } = await w.recognize(file);
+        return data.confidence >= 55 && goodText(data.text) ? [{ index: 0, markdown: data.text }] : null;
+      }
+      setBusy(id, 'Opening the PDF…', 0.08);
+      await loadScript(LIB.pdf);
+      const pdfjs = window.pdfjsLib; pdfjs.GlobalWorkerOptions.workerSrc = LIB.pdfWorker;
+      const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+      const n = Math.min(doc.numPages, 150);
+      const pages = [], scanned = [];
+      for (let i = 0; i < n; i++) {
+        stopIf(signal);
+        const page = await doc.getPage(i + 1);
+        const text = linesFromItems((await page.getTextContent()).items);
+        if (goodText(text)) pages.push({ index: i, markdown: text }); else scanned.push(i);
+        if (i % 5 === 0) setBusy(id, `Reading page ${i + 1} of ${n}…`, 0.08 + 0.1 * i / n);
+      }
+      // digital text already has the profit or loss statement: no need to OCR the odd scanned page (e.g. signatures)
+      const hasPL = pages.some(p => scorePage(p.markdown, p.index) >= 10);
+      if (scanned.length && !hasPL) {
+        const todo = scanned.slice(0, 80);
+        setBusy(id, `Scanned pages found. Loading free OCR…`, 0.2);
+        const w = await tessWorker();
+        let conf = 0, good = 0;
+        for (let k = 0; k < todo.length; k++) {
+          stopIf(signal);
+          setBusy(id, `Free OCR on scanned page ${k + 1} of ${todo.length} (a few seconds each)…`, 0.2 + 0.4 * k / todo.length);
+          const page = await doc.getPage(todo[k] + 1);
+          const vp = page.getViewport({ scale: 2 });
+          const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+          await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+          const { data } = await w.recognize(cv);
+          cv.width = cv.height = 0;
+          if (goodText(data.text)) { pages.push({ index: todo[k], markdown: data.text }); conf += data.confidence || 0; good++; }
+        }
+        if (!good || conf / good < 50) return null; // blank or too blurry for free OCR
+        pages.sort((a, b) => a.index - b.index);
+      }
+      doc.destroy();
+      return pages.length ? pages : null;
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      console.warn('Free reading failed, using Mistral OCR instead:', e);
+      return null;
+    }
+  }
+  /* Paid fallback: Mistral OCR on the server (used only when the free reading in the browser isn't good enough). */
+  async function serverOcr(id, f, fm, ctl) {
+    setBusy(id, 'Checking the file…', 0.08);
+    const buf = await f.file.arrayBuffer();
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
+    const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash }, { signal: ctl.signal });
+    if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
+    else {
+      await uploadDirect(st.upload, new Blob([buf], { type: fm.mime }), ctl.signal, pct => setBusy(id, `Uploading the file (${pct}%)…`, 0.08 + pct / 100 * 0.12));
+      await api('ocr_go', { run: st.run }, { signal: ctl.signal });
+    }
+    const t0 = Date.now();
+    for (;;) {
+      await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
+      const secs = Math.round((Date.now() - t0) / 1000);
+      if (!st.reused) setBusy(id, `Running OCR on every page (${secs}s). Scanned accounts can take a few minutes…`, Math.min(0.55, 0.2 + secs / 400));
+      const r = await api('ocr_status', { run: st.run }, { signal: ctl.signal });
+      if (r.status === 'done') return r.pages || [];
+      if (r.status === 'error') throw new Error(r.error || 'OCR failed. Try again.');
+      if (secs > 600) throw new Error('OCR is taking too long. Try a smaller file with only the financial statements pages.');
+    }
+  }
   async function extract(id, quiet) {
     const job = state.job, c = findCo(id), f = state.files[id];
     if (!c || !f || state.busy[id]) return;
@@ -510,26 +637,11 @@
       let pages = state.ocr[id] ? state.ocr[id].pages : null;
       if (!pages) {
         const fm = fileMode(f.file);
-        if (fm.mode === 'ocr') {
-          setBusy(id, 'Checking the file…', 0.08);
-          const buf = await f.file.arrayBuffer();
-          const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
-          const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash }, { signal: ctl.signal });
-          if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
-          else {
-            await uploadDirect(st.upload, new Blob([buf], { type: fm.mime }), ctl.signal, pct => setBusy(id, `Uploading the file (${pct}%)…`, 0.08 + pct / 100 * 0.12));
-            await api('ocr_go', { run: st.run }, { signal: ctl.signal });
-          }
-          const t0 = Date.now();
-          for (;;) {
-            await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
-            const secs = Math.round((Date.now() - t0) / 1000);
-            if (!st.reused) setBusy(id, `Running OCR on every page (${secs}s). Scanned accounts can take a few minutes…`, Math.min(0.55, 0.2 + secs / 400));
-            const r = await api('ocr_status', { run: st.run }, { signal: ctl.signal });
-            if (r.status === 'done') { pages = r.pages || []; break; }
-            if (r.status === 'error') throw new Error(r.error || 'OCR failed. Try again.');
-            if (secs > 600) throw new Error('OCR is taking too long. Try a smaller file with only the financial statements pages.');
-          }
+        if (fm.mode === 'ocr' && (fm.mime === 'application/pdf' || fm.mime.startsWith('image/'))) {
+          pages = await browserRead(f.file, fm.mime, id, ctl.signal);
+          if (!pages) pages = await serverOcr(id, f, fm, ctl);
+        } else if (fm.mode === 'ocr') {
+          pages = await serverOcr(id, f, fm, ctl);
         } else {
           setBusy(id, 'Reading the spreadsheet…', 0.3);
           pages = await localPages(f.file);
