@@ -433,7 +433,7 @@
   }
   function okFile(f) {
     const m = fileMode(f); if (m.error) { toast(m.error); return false; }
-    if (f.size > 20 * 1048576) { toast(`${f.name} is over 20 MB. Upload only the financial statements pages.`); return false; }
+    if (f.size > 50 * 1048576) { toast(`${f.name} is over 50 MB. Upload only the financial statements pages.`); return false; }
     return true;
   }
   async function localPages(f) {
@@ -486,6 +486,22 @@
     if (/statements? of (changes in equity|cash flows)/.test(t) && s < 10) s -= 3;
     return s;
   }
+  // Upload straight to private Storage with a one-time link (shows progress; does not pass through the API).
+  function uploadDirect(url, blob, signal, onPct) {
+    return new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open('PUT', url);
+      x.setRequestHeader('apikey', window.TNMM_CONFIG.apiKey);
+      x.setRequestHeader('Content-Type', blob.type);
+      x.setRequestHeader('x-upsert', 'true');
+      x.upload.onprogress = e => { if (e.lengthComputable) onPct(Math.round(e.loaded / e.total * 100)); };
+      x.onload = () => x.status >= 200 && x.status < 300 ? resolve() : reject(new Error('Upload failed (' + x.status + '): ' + (x.responseText || '').slice(0, 160)));
+      x.onerror = () => reject(new Error('Upload failed. Check your internet connection and try again.'));
+      x.ontimeout = () => reject(new Error('Upload timed out. Try again.'));
+      signal.addEventListener('abort', () => { x.abort(); reject(new DOMException('Stopped', 'AbortError')); }, { once: true });
+      x.send(blob);
+    });
+  }
   async function extract(id, quiet) {
     const job = state.job, c = findCo(id), f = state.files[id];
     if (!c || !f || state.busy[id]) return;
@@ -495,10 +511,16 @@
       if (!pages) {
         const fm = fileMode(f.file);
         if (fm.mode === 'ocr') {
-          setBusy(id, 'Uploading the file…', 0.15);
-          const st = await api('ocr', new Blob([f.file], { type: fm.mime }), { signal: ctl.signal, headers: { 'X-File-Name': encodeURIComponent(f.name) } });
-          const t0 = Date.now();
+          setBusy(id, 'Checking the file…', 0.08);
+          const buf = await f.file.arrayBuffer();
+          const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
+          const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash }, { signal: ctl.signal });
           if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
+          else {
+            await uploadDirect(st.upload, new Blob([buf], { type: fm.mime }), ctl.signal, pct => setBusy(id, `Uploading the file (${pct}%)…`, 0.08 + pct / 100 * 0.12));
+            await api('ocr_go', { run: st.run }, { signal: ctl.signal });
+          }
+          const t0 = Date.now();
           for (;;) {
             await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
             const secs = Math.round((Date.now() - t0) / 1000);

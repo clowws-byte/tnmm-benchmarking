@@ -4,7 +4,6 @@
 // Jobs live in public.tnmm_jobs here; Mistral OCR runs here with the MISTRAL_API_KEY secret.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
-import { encodeBase64 } from "jsr:@std/encoding@1.0.5/base64";
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
 
 const CCT_URL = "https://orszbsqshrzhjgtlihzc.supabase.co";
@@ -13,13 +12,13 @@ const APP_MATCH = Deno.env.get("TNMM_PORTAL_URL_MATCH") ?? "tnmm-benchmarking";
 const MISTRAL = "https://api.mistral.ai/v1";
 const OCR_MODEL = Deno.env.get("MISTRAL_OCR_MODEL") ?? "mistral-ocr-latest";
 const CHAT_MODEL = Deno.env.get("MISTRAL_CHAT_MODEL") ?? "mistral-large-latest";
-const MAX_FILE = 20 * 1024 * 1024;
+const MAX_FILE = 50 * 1024 * 1024;
 // PDFs, Word, PowerPoint and images go to Mistral OCR; spreadsheets and text are read in the browser.
 const OCR_TYPES = /^(application\/pdf|image\/(png|jpeg|webp|gif|avif)|application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|presentationml\.presentation))$/;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-file-name",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 const json = (body: unknown, status = 200) =>
@@ -47,27 +46,20 @@ async function identify(token: string) {
 }
 
 /* OCR runs in the background (a scanned PDF can take longer than one request may stay open).
-   PDFs and Office files are uploaded to Mistral's file store, read through a short-lived link, then deleted. */
-async function runOcr(db: any, runId: string, bytes: Uint8Array, mime: string, name: string, key: string) {
-  let fileId: string | null = null;
-  const auth = { Authorization: `Bearer ${key}` };
+   The browser uploads the file straight to private Storage (tnmm-uploads/<user>/<run>); Mistral reads it
+   through a 10-minute signed link, and the file is deleted as soon as OCR finishes. */
+const BUCKET = "tnmm-uploads";
+async function runOcr(db: any, runId: string, path: string, mime: string, key: string) {
+  const t0 = Date.now();
   try {
-    let document: Record<string, string>;
-    if (mime.startsWith("image/")) {
-      document = { type: "image_url", image_url: `data:${mime};base64,${encodeBase64(bytes)}` };
-    } else {
-      const fd = new FormData();
-      fd.append("purpose", "ocr");
-      fd.append("file", new Blob([bytes], { type: mime }), name || "accounts.pdf");
-      const up = await fetch(`${MISTRAL}/files`, { method: "POST", headers: auth, body: fd });
-      if (!up.ok) throw new Error(`Upload to Mistral failed (${up.status}): ${(await up.text()).slice(0, 200)}`);
-      fileId = (await up.json()).id;
-      const su = await fetch(`${MISTRAL}/files/${fileId}/url?expiry=1`, { headers: auth });
-      if (!su.ok) throw new Error(`Mistral file link failed (${su.status}): ${(await su.text()).slice(0, 200)}`);
-      document = { type: "document_url", document_url: (await su.json()).url };
-    }
+    const { data: signed, error: se } = await db.storage.from(BUCKET).createSignedUrl(path, 600);
+    if (se || !signed?.signedUrl) throw new Error("The uploaded file was not found. Upload it again.");
+    const document = mime.startsWith("image/")
+      ? { type: "image_url", image_url: signed.signedUrl }
+      : { type: "document_url", document_url: signed.signedUrl };
+    console.log(`ocr ${runId}: calling Mistral`);
     const r = await fetch(`${MISTRAL}/ocr`, {
-      method: "POST", headers: { ...auth, "Content-Type": "application/json" },
+      method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: OCR_MODEL, document, include_image_base64: false }),
     });
     if (!r.ok) throw new Error(`Mistral OCR failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
@@ -75,10 +67,12 @@ async function runOcr(db: any, runId: string, bytes: Uint8Array, mime: string, n
     const pages = (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") }));
     if (!pages.length) throw new Error("OCR returned no text. Check the file is the accounts.");
     await db.from("tnmm_ocr_runs").update({ status: "done", pages, page_count: pages.length, updated_at: new Date().toISOString() }).eq("id", runId);
+    console.log(`ocr ${runId}: done, ${pages.length} pages in ${Date.now() - t0} ms`);
   } catch (e) {
+    console.log(`ocr ${runId}: error ${String((e as any)?.message || e)}`);
     await db.from("tnmm_ocr_runs").update({ status: "error", error: String((e as any)?.message || e).slice(0, 400), updated_at: new Date().toISOString() }).eq("id", runId);
   } finally {
-    if (fileId) await fetch(`${MISTRAL}/files/${fileId}`, { method: "DELETE", headers: auth }).catch(() => {});
+    await db.storage.from(BUCKET).remove([path]).catch(() => {});
   }
 }
 
@@ -176,39 +170,63 @@ Deno.serve(async (req) => {
     }
 
     const key = Deno.env.get("MISTRAL_API_KEY");
-    if (action === "ocr" || action === "extract") {
+    if (action === "ocr_start" || action === "ocr_go" || action === "extract") {
       if (!key) return json({ error: "The OCR key is not set up yet. An admin needs to add MISTRAL_API_KEY in Supabase Edge Function secrets." }, 503);
     }
 
-    if (action === "ocr") {
-      // the file arrives as the raw request body; it is not kept after OCR
-      const mime = (req.headers.get("Content-Type") || "").split(";")[0].trim();
+    if (action === "ocr_start") {
+      // Step 1: the browser sends the file's fingerprint. Reuse an earlier OCR of the same file, or hand back
+      // a one-time upload link so the file goes straight to private Storage (not through this function).
+      const b = await req.json();
+      const mime = String(b.mime || "");
+      const hash = String(b.hash || "").toLowerCase();
+      const size = Number(b.size) || 0;
+      const name = String(b.name || "accounts").slice(0, 120);
       if (!OCR_TYPES.test(mime)) return json({ error: "This file type cannot be read. Use PDF, Word, PowerPoint, an image, Excel or CSV." }, 415);
-      const bytes = new Uint8Array(await req.arrayBuffer());
-      if (!bytes.length) return json({ error: "The file was empty." }, 400);
-      if (bytes.length > MAX_FILE) return json({ error: "The file is over 20 MB. Upload only the financial statements pages." }, 413);
-      const name = decodeURIComponent(req.headers.get("X-File-Name") || "accounts").slice(0, 120);
-      // Never pay twice for the same file: reuse a finished OCR of identical bytes from the last day,
-      // or join one still running (started under 10 minutes ago).
-      const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))).map(x => x.toString(16).padStart(2, "0")).join("");
+      if (!/^[0-9a-f]{64}$/.test(hash)) return json({ error: "Bad request." }, 400);
+      if (!size) return json({ error: "The file was empty." }, 400);
+      if (size > MAX_FILE) return json({ error: "The file is over 50 MB. Upload only the financial statements pages." }, 413);
+      // tidy up: remove any of this user's uploads left behind (older than an hour) by an interrupted run
+      db.storage.from(BUCKET).list(uid, { limit: 100 }).then(({ data }: any) => {
+        const old = (data || []).filter((o: any) => Date.parse(o.created_at) < Date.now() - 3600000).map((o: any) => `${uid}/${o.name}`);
+        if (old.length) return db.storage.from(BUCKET).remove(old);
+      }).catch(() => {});
       const since = new Date(Date.now() - 86400000).toISOString(), fresh = Date.now() - 600000;
       const { data: prior } = await db.from("tnmm_ocr_runs").select("id,status,created_at").eq("owner", uid).eq("file_hash", hash)
         .gte("created_at", since).in("status", ["done", "running"]).order("created_at", { ascending: false }).limit(5);
       const reuse = (prior || []).find((r: any) => r.status === "done" || Date.parse(r.created_at) > fresh);
       if (reuse) return json({ run: reuse.id, reused: true });
-      const { data: run, error } = await db.from("tnmm_ocr_runs").insert({ owner: uid, file_name: name, file_hash: hash }).select("id").single();
+      const { data: run, error } = await db.from("tnmm_ocr_runs").insert({ owner: uid, file_name: name, file_hash: hash, mime, status: "waiting" }).select("id").single();
       if (error) throw error;
-      EdgeRuntime.waitUntil(runOcr(db, run.id, bytes, mime, name, key!));
-      return json({ run: run.id, reused: false });
+      const { data: up, error: ue } = await db.storage.from(BUCKET).createSignedUploadUrl(`${uid}/${run.id}`);
+      if (ue || !up) throw new Error("Could not prepare the upload: " + (ue?.message || "unknown"));
+      return json({ run: run.id, reused: false, upload: up.signedUrl });
+    }
+
+    if (action === "ocr_go") {
+      // Step 2: the file is in Storage; start OCR in the background (once only).
+      const b = await req.json();
+      if (!UUID.test(String(b.run || ""))) return json({ error: "Bad request." }, 400);
+      const { data: started } = await db.from("tnmm_ocr_runs").update({ status: "running", created_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq("id", b.run).eq("owner", uid).eq("status", "waiting").select("id,mime");
+      if (!started?.length) return json({ ok: true, already: true });
+      EdgeRuntime.waitUntil(runOcr(db, b.run, `${uid}/${b.run}`, started[0].mime, key!));
+      return json({ ok: true });
     }
 
     if (action === "ocr_status") {
       const b = await req.json();
       if (!UUID.test(String(b.run || ""))) return json({ error: "Bad request." }, 400);
-      const { data, error } = await db.from("tnmm_ocr_runs").select("status,pages,error").eq("id", b.run).eq("owner", uid).maybeSingle();
+      const { data, error } = await db.from("tnmm_ocr_runs").select("status,pages,error,created_at").eq("id", b.run).eq("owner", uid).maybeSingle();
       if (error) throw error;
       if (!data) return json({ error: "That OCR run was not found." }, 404);
-      return json(data);
+      // the background worker can be stopped by the platform's time limit; don't leave the user waiting forever
+      if ((data.status === "running" || data.status === "waiting") && Date.now() - Date.parse(data.created_at) > 7 * 60000) {
+        const msg = data.status === "waiting" ? "The upload did not finish. Try again." : "OCR stopped before finishing (the file may be too long). Try a file with only the financial statements pages.";
+        await db.from("tnmm_ocr_runs").update({ status: "error", error: msg }).eq("id", b.run);
+        return json({ status: "error", error: msg });
+      }
+      return json({ status: data.status, pages: data.pages, error: data.error });
     }
 
     if (action === "extract") {
