@@ -1,0 +1,5 @@
+-- Transfer Pricing Supabase project (ref fqxxrqjrbhrifybzxvly): schema used by TNMM Benchmarking.
+-- Already applied as migration "tp_core_and_tnmm". Kept here for reference.
+-- Tables: tp_profiles (staff, role, approval status), tp_preapproved (emails approved on sign-up),
+--         tnmm_jobs (one row per benchmarking job, figures in jsonb). Private bucket tnmm-uploads
+--         holds an uploaded PDF only until OCR has run. RLS is on everywhere.

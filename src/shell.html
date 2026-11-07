@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TNMM Benchmarking · Transfer Pricing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>/*CSS*/</style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script>
+  window.TNMM_CONFIG = {
+    url: 'https://fqxxrqjrbhrifybzxvly.supabase.co',
+    key: 'sb_publishable_seZcZb_POYUZWVl_2J7EtA_zsutTEn0'
+  };
+</script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><b><i aria-hidden="true"></i> TNMM Benchmarking</b><span>Cheng &amp; Co Taxation · Transfer Pricing</span></div>
+  <div class="spacer"></div>
+  <span class="save" id="save" aria-live="polite"></span>
+  <div class="who" id="who" hidden><span id="whoname"></span>
+    <button class="btn sm" id="adminbtn" data-act="admin" hidden>Users</button>
+    <button class="btn sm" data-act="signout">Sign out</button></div>
+  <button class="btn primary" id="dl" data-act="download" hidden>Download Excel</button>
+</header>
+<div id="authview"><p class="empty">Loading…</p></div>
+<div class="shell" hidden>
+  <nav class="rail" aria-label="Benchmarking jobs">
+    <h2>Jobs</h2>
+    <div class="list" id="jobs"></div>
+    <div class="foot">
+      <button class="btn sm primary" data-act="new">+ New job</button>
+      <button class="btn sm" data-act="dup">Duplicate</button>
+      <button class="btn sm ghost danger" data-act="del">Delete</button>
+    </div>
+  </nav>
+  <main class="main" id="main"></main>
+</div>
+<script>window.EXAMPLE_JOB = /*EXAMPLE*/;</script>
+<script>/*CORE*/</script>
+<script>/*APP*/</script>
+</body>
+</html>
