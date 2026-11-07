@@ -74,7 +74,7 @@ async function runOcr(db: any, runId: string, bytes: Uint8Array, mime: string, n
     const out = await r.json();
     const pages = (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") }));
     if (!pages.length) throw new Error("OCR returned no text. Check the file is the accounts.");
-    await db.from("tnmm_ocr_runs").update({ status: "done", pages, updated_at: new Date().toISOString() }).eq("id", runId);
+    await db.from("tnmm_ocr_runs").update({ status: "done", pages, page_count: pages.length, updated_at: new Date().toISOString() }).eq("id", runId);
   } catch (e) {
     await db.from("tnmm_ocr_runs").update({ status: "error", error: String((e as any)?.message || e).slice(0, 400), updated_at: new Date().toISOString() }).eq("id", runId);
   } finally {
@@ -188,10 +188,18 @@ Deno.serve(async (req) => {
       if (!bytes.length) return json({ error: "The file was empty." }, 400);
       if (bytes.length > MAX_FILE) return json({ error: "The file is over 20 MB. Upload only the financial statements pages." }, 413);
       const name = decodeURIComponent(req.headers.get("X-File-Name") || "accounts").slice(0, 120);
-      const { data: run, error } = await db.from("tnmm_ocr_runs").insert({ owner: uid, file_name: name }).select("id").single();
+      // Never pay twice for the same file: reuse a finished OCR of identical bytes from the last day,
+      // or join one still running (started under 10 minutes ago).
+      const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))).map(x => x.toString(16).padStart(2, "0")).join("");
+      const since = new Date(Date.now() - 86400000).toISOString(), fresh = Date.now() - 600000;
+      const { data: prior } = await db.from("tnmm_ocr_runs").select("id,status,created_at").eq("owner", uid).eq("file_hash", hash)
+        .gte("created_at", since).in("status", ["done", "running"]).order("created_at", { ascending: false }).limit(5);
+      const reuse = (prior || []).find((r: any) => r.status === "done" || Date.parse(r.created_at) > fresh);
+      if (reuse) return json({ run: reuse.id, reused: true });
+      const { data: run, error } = await db.from("tnmm_ocr_runs").insert({ owner: uid, file_name: name, file_hash: hash }).select("id").single();
       if (error) throw error;
       EdgeRuntime.waitUntil(runOcr(db, run.id, bytes, mime, name, key!));
-      return json({ run: run.id });
+      return json({ run: run.id, reused: false });
     }
 
     if (action === "ocr_status") {
@@ -200,7 +208,6 @@ Deno.serve(async (req) => {
       const { data, error } = await db.from("tnmm_ocr_runs").select("status,pages,error").eq("id", b.run).eq("owner", uid).maybeSingle();
       if (error) throw error;
       if (!data) return json({ error: "That OCR run was not found." }, 404);
-      if (data.status === "done") await db.from("tnmm_ocr_runs").delete().eq("id", b.run);
       return json(data);
     }
 

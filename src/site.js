@@ -498,10 +498,11 @@
           setBusy(id, 'Uploading the file…', 0.15);
           const st = await api('ocr', new Blob([f.file], { type: fm.mime }), { signal: ctl.signal, headers: { 'X-File-Name': encodeURIComponent(f.name) } });
           const t0 = Date.now();
+          if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
           for (;;) {
             await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
             const secs = Math.round((Date.now() - t0) / 1000);
-            setBusy(id, `Running OCR on every page (${secs}s). Scanned accounts can take a few minutes…`, Math.min(0.55, 0.2 + secs / 400));
+            if (!st.reused) setBusy(id, `Running OCR on every page (${secs}s). Scanned accounts can take a few minutes…`, Math.min(0.55, 0.2 + secs / 400));
             const r = await api('ocr_status', { run: st.run }, { signal: ctl.signal });
             if (r.status === 'done') { pages = r.pages || []; break; }
             if (r.status === 'error') throw new Error(r.error || 'OCR failed. Try again.');
