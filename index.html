@@ -1082,9 +1082,23 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
   function setBusy(id, msg, p) { state.busy[id] = { msg, p }; if (state.tab === 'companies' || state.tab === 'upload') renderMain(); }
 
   /* Pick the pages that matter from the OCR text: the profit or loss statement and the notes behind it. */
+  // How much a page looks like the statement of profit or loss itself (works on noisy OCR text and any title wording)
+  function plScore(md) {
+    const t = String(md || '').toLowerCase(); let s = 0;
+    if (/revenue|turnover|\bsales\b/.test(t)) s += 3;
+    if (/cost\s*of\s*(sales|goods)/.test(t)) s += 4;
+    if (/gross\s*(profit|loss)/.test(t)) s += 4;
+    if (/before\s*tax/.test(t)) s += 4;
+    if (/administrative|distribution|selling|operating expenses/.test(t)) s += 2;
+    s += Math.min(6, ((t.match(/\(?\d{1,3}(,\d{3})+\)?/g) || []).length) / 5);
+    if (/financial position|cash flows?|changes in equity|retained (earnings|profits)/.test(t)) s -= 5;
+    if (/directors'? report|auditors'? report|report on the audit/.test(t)) s -= 6;
+    return s;
+  }
   function scorePage(md, i) {
     const t = md.toLowerCase(); let s = 0;
-    if (/statements? of (profit or loss|comprehensive income)|income statement/.test(t) && /revenue/.test(t) && /before tax/.test(t)) s += 10;
+    if (/statements? of (profit or loss|comprehensive income)|income statement|profit and loss|statement of income/.test(t) && /revenue|turnover|sales/.test(t) && /before tax/.test(t)) s += 10;
+    else if (plScore(md) >= 15) s += 10;
     if (/(profit|loss) before tax/.test(t) && /(after charging|arrived at|crediting)/.test(t)) s += 8;
     if (/related part/.test(t)) s += 7;
     if (/other (operating )?income/.test(t)) s += 3;
@@ -1338,6 +1352,17 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
       const win = job.windowFrom && job.windowTo ? `between ${fmtFye(isoDay(job.windowFrom, false))} and ${fmtFye(isoDay(job.windowTo, true))}` : '';
       const out = await api('extract', { pages: pick, role: c.isTested ? 'tested' : 'comparable', fye: job.tp.fye, window: win, kind: c.docKind === 'management' ? 'management' : 'audited' }, { signal: ctl.signal });
       applyExtraction(c, out.result, pick.map(p => p.index + 1));
+      // No revenue found: the profit or loss page was probably not among the pages sent. Try once more with
+      // the pages that look most like that statement (by figures and line names), plus the notes already used.
+      if (!T.num(c.pl.rev) && pages.length > pick.length) {
+        const used = new Set(pick.map(p => p.index));
+        const pl = pages.filter(p => !used.has(p.index)).map(p => ({ p, s: plScore(p.markdown) })).sort((a, b) => b.s - a.s).slice(0, 5).map(x => x.p);
+        const again = [...pl, ...pick].slice(0, 18).sort((a, b) => a.index - b.index);
+        setBusy(id, `Profit or loss statement not found. Trying pages ${pl.map(p => p.index + 1).join(', ')}…`, 0.8);
+        const out2 = await api('extract', { pages: again, role: c.isTested ? 'tested' : 'comparable', fye: job.tp.fye, window: win, kind: c.docKind === 'management' ? 'management' : 'audited' }, { signal: ctl.signal });
+        if (out2 && out2.result && T.num((out2.result.pl || {}).rev)) applyExtraction(c, out2.result, again.map(p => p.index + 1));
+      }
+      if (!T.num(c.pl.rev)) c.warnings = [...(c.warnings || []), 'Revenue was not found. Open "View OCR text" to check the statement of profit or loss was read, or enter the figures by hand.'];
       delete state.errors[id];
       if (!quiet) toast(`${c.name || 'Company'}: figures read. Please check them against the accounts.`);
     } catch (e) {
