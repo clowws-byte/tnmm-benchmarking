@@ -571,12 +571,14 @@
       const pdfjs = window.pdfjsLib; pdfjs.GlobalWorkerOptions.workerSrc = LIB.pdfWorker;
       const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
       const n = Math.min(doc.numPages, 150);
-      const pages = [], scanned = [];
+      const pages = [], scanned = [], layer = {};
       for (let i = 0; i < n; i++) {
         stopIf(signal);
         const page = await doc.getPage(i + 1);
         const text = linesFromItems((await page.getTextContent()).items);
-        if (goodText(text)) pages.push({ index: i, markdown: text }); else scanned.push(i);
+        // a page with only a little text (e.g. a scanner stamp or header over a scanned image) is treated as scanned
+        const chars = text.replace(/\s/g, '').length;
+        if (goodText(text) && chars >= 400) pages.push({ index: i, markdown: text }); else { scanned.push(i); layer[i] = text; }
         if (i % 5 === 0) setBusy(id, `Reading page ${i + 1} of ${n}…`, 0.08 + 0.1 * i / n);
       }
       // digital text already has the profit or loss statement: no need to OCR the odd scanned page (e.g. signatures)
@@ -596,10 +598,14 @@
           const { data } = await w.recognize(cv);
           cv.width = cv.height = 0;
           if (goodText(data.text)) { pages.push({ index: todo[k], markdown: data.text }); conf += data.confidence || 0; good++; }
+          else if (goodText(layer[todo[k]])) pages.push({ index: todo[k], markdown: layer[todo[k]] });
         }
         if (!good || conf / good < 50) { state.why[id] = good ? `scan too unclear for free OCR (confidence ${Math.round(conf / good)}%)` : 'no readable text found on the scanned pages'; return null; }
         pages.sort((a, b) => a.index - b.index);
       }
+      // P&L found in the digital text: keep any short pages' own text too (covers, headings)
+      if (hasPL) scanned.forEach(i => { if (goodText(layer[i])) pages.push({ index: i, markdown: layer[i] }); });
+      pages.sort((a, b) => a.index - b.index);
       doc.destroy();
       if (!pages.length) state.why[id] = 'no readable text in the PDF';
       return pages.length ? pages : null;
@@ -752,8 +758,18 @@
     });
     if (out.rpt) c.rpt = { sales: T.num(out.rpt.sales), purchases: T.num(out.rpt.purchases) };
     c.keptIn = (out.kept_in || []).filter(x => x && x.item).slice(0, 12).map(x => ({ item: String(x.item), amount: T.num(x.amount), reason: String(x.reason || '') }));
-    const k = T.calcCompany(c);
     const w = (out.warnings || []).filter(x => x && String(x).trim()).map(String).slice(0, 10);
+    // Rental income taken out => its investment property depreciation comes out too (safety net if the AI left it in)
+    if (T.num(c.adj.less_rental_nonop) < 0 && !T.num(c.adj.add_ip_depreciation)) {
+      const i = c.keptIn.findIndex(x => /depreciation/i.test(x.item) && /investment propert/i.test(x.item));
+      if (i >= 0) {
+        c.adj.add_ip_depreciation = Math.abs(c.keptIn[i].amount);
+        c.adjNotes.add_ip_depreciation = c.keptIn[i].item + ' (rental income excluded, so its depreciation is added back)';
+        c.keptIn.splice(i, 1);
+      } else w.push('Rental income was excluded. If the company has investment properties, add back their depreciation.');
+    }
+    if (T.num(c.adj.add_ip_depreciation) && !T.num(c.adj.less_rental_nonop)) w.push('Investment property depreciation is added back but no rental income was excluded. Check both lines.');
+    const k = T.calcCompany(c);
     if (Math.abs(k.gp - (k.rev + k.cos)) > 1) w.push('Gross profit does not agree.');
     if (k.pbtCheck === false) w.push(`Computed PBT ${fmt(k.pbt)} does not agree to the accounts (${fmt(T.num(c.pbtReported))}). Check the line mapping.`);
     c.warnings = w;

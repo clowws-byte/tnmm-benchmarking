@@ -14,20 +14,21 @@
     pat:'Profit / (loss) after taxation'
   };
   const ADJ_KEYS = ['less_interest','less_dividend','adj_invest_disposal','adj_invest_fv',
-    'less_rental_nonop','adj_nontrade_forex','less_exceptional_income','add_exceptional_expense'];
+    'less_rental_nonop','add_ip_depreciation','adj_nontrade_forex','less_exceptional_income','add_exceptional_expense'];
   const ADJ_LABELS = {
     less_interest:'Less: Interest income',
     less_dividend:'Less: Dividend income',
     adj_invest_disposal:'Less / add: (Gain) / loss on disposal of investments',
     adj_invest_fv:'Less / add: Fair value (gain) / loss on investments',
     less_rental_nonop:'Less: Rental income (non-operating)',
+    add_ip_depreciation:'Add back: Depreciation of investment properties',
     adj_nontrade_forex:'Less / add: Non-trade foreign exchange (gain) / loss',
     less_exceptional_income:'Less: Exceptional non-recurring income',
     add_exceptional_expense:'Add back: Exceptional non-recurring expense'
   };
   /* Expected sign of each adjustment as a contribution to NormOP: -1 only negative, +1 only positive, 0 either */
   const ADJ_SIGN = { less_interest:-1, less_dividend:-1, adj_invest_disposal:0, adj_invest_fv:0,
-    less_rental_nonop:-1, adj_nontrade_forex:0, less_exceptional_income:-1, add_exceptional_expense:1 };
+    less_rental_nonop:-1, add_ip_depreciation:1, adj_nontrade_forex:0, less_exceptional_income:-1, add_exceptional_expense:1 };
   const BASIS = {
     YA2023:     { lo:0.375, hi:0.625, median:true,  label:'37.5th - 62.5th percentile' },
     PRE_YA2023: { lo:0.25,  hi:0.75,  median:false, label:'25th - 75th percentile (interquartile range)' }

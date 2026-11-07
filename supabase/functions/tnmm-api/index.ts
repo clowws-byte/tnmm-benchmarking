@@ -16,7 +16,7 @@ const MAX_FILE = 50 * 1024 * 1024;
 // Google Gemini (preferred when its key is set). Accepts any of these secret names.
 const GEMINI_KEY = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY", "GEMINI_KEY"].map(n => Deno.env.get(n)).find(Boolean) || "";
 const GEMINI = "https://generativelanguage.googleapis.com";
-const GEMINI_MODELS = [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"].filter(Boolean) as string[])];
+const GEMINI_MODELS = [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-flash-latest", "gemini-flash-lite-latest"].filter(Boolean) as string[])];
 // File types the server can OCR (only used when reading in the browser fails).
 const OCR_TYPES = /^(application\/pdf|image\/(png|jpeg|webp|gif|avif)|application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|presentationml\.presentation))$/;
 
@@ -179,7 +179,7 @@ async function runOcr(db: any, runId: string, path: string, mime: string, key: s
 }
 
 const ADJ_KEYS = ["less_interest", "less_dividend", "adj_invest_disposal", "adj_invest_fv", "less_rental_nonop",
-  "adj_nontrade_forex", "less_exceptional_income", "add_exceptional_expense"];
+  "add_ip_depreciation", "adj_nontrade_forex", "less_exceptional_income", "add_exceptional_expense"];
 
 function extractPrompt(ctx: { role: string; fye?: string; window?: string; kind?: string }, pages: { index: number; markdown: string }[]) {
   const target = ctx.role === "tested"
@@ -205,10 +205,11 @@ Every line on the face must land in exactly one key so that rev+cos+ooi+dist+adm
 - adj_invest_disposal: gain (negative) or loss (positive) on disposal of investments (not PPE)
 - adj_invest_fv: fair value gain (negative) or loss (positive) on investments
 - less_rental_nonop (negative): rental income not from the company's core business
+- add_ip_depreciation (positive): depreciation of investment properties (the cost that earns that rental income). Use it whenever less_rental_nonop is used and the notes show investment property depreciation; do not put it under add_exceptional_expense or kept_in
 - adj_nontrade_forex: non-trade foreign exchange gain (negative) or loss (positive), e.g. on loans; only if the note shows it is non-trade
 - less_exceptional_income (negative): genuinely one-off non-recurring income (e.g. one-off insurance claim, one-off wage subsidy)
-- add_exceptional_expense (positive): genuinely one-off non-recurring expense (e.g. impairment of PPE or investments, a one-off write-off from a specific event)
-Do NOT adjust these; list them under kept_in: PPE disposal gains or losses, trade foreign exchange (realised or unrealised), normal bad debts or their reversals, payables written back, routine write-offs, depreciation. Finance costs are added back automatically, so do not include them.
+- add_exceptional_expense (positive): genuinely one-off non-recurring expense (e.g. impairment of PPE or investments, a one-off write-off from a specific event); never depreciation
+Do NOT adjust these; list them under kept_in: PPE disposal gains or losses, trade foreign exchange (realised or unrealised), normal bad debts or their reversals, payables written back, routine write-offs, depreciation of property, plant and equipment. Finance costs are added back automatically, so do not include them.
 
 3. Related party transactions for the same year: total sales to related parties and total purchases from related parties, in full ringgit; 0 if none disclosed.
 
