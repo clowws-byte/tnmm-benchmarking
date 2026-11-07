@@ -4,6 +4,8 @@
 // Jobs live in public.tnmm_jobs here; Mistral OCR runs here with the MISTRAL_API_KEY secret.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+import { encodeBase64 } from "jsr:@std/encoding@1.0.5/base64";
+declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
 
 const CCT_URL = "https://orszbsqshrzhjgtlihzc.supabase.co";
 const CCT_KEY = "sb_publishable_by4wqCu53U9son8u0kp1qA_Uij0ysHW"; // CCTaxLab public (publishable) key
@@ -44,10 +46,40 @@ async function identify(token: string) {
   return { user, profile };
 }
 
-function b64(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(s);
+/* OCR runs in the background (a scanned PDF can take longer than one request may stay open).
+   PDFs and Office files are uploaded to Mistral's file store, read through a short-lived link, then deleted. */
+async function runOcr(db: any, runId: string, bytes: Uint8Array, mime: string, name: string, key: string) {
+  let fileId: string | null = null;
+  const auth = { Authorization: `Bearer ${key}` };
+  try {
+    let document: Record<string, string>;
+    if (mime.startsWith("image/")) {
+      document = { type: "image_url", image_url: `data:${mime};base64,${encodeBase64(bytes)}` };
+    } else {
+      const fd = new FormData();
+      fd.append("purpose", "ocr");
+      fd.append("file", new Blob([bytes], { type: mime }), name || "accounts.pdf");
+      const up = await fetch(`${MISTRAL}/files`, { method: "POST", headers: auth, body: fd });
+      if (!up.ok) throw new Error(`Upload to Mistral failed (${up.status}): ${(await up.text()).slice(0, 200)}`);
+      fileId = (await up.json()).id;
+      const su = await fetch(`${MISTRAL}/files/${fileId}/url?expiry=1`, { headers: auth });
+      if (!su.ok) throw new Error(`Mistral file link failed (${su.status}): ${(await su.text()).slice(0, 200)}`);
+      document = { type: "document_url", document_url: (await su.json()).url };
+    }
+    const r = await fetch(`${MISTRAL}/ocr`, {
+      method: "POST", headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: OCR_MODEL, document, include_image_base64: false }),
+    });
+    if (!r.ok) throw new Error(`Mistral OCR failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
+    const out = await r.json();
+    const pages = (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") }));
+    if (!pages.length) throw new Error("OCR returned no text. Check the file is the accounts.");
+    await db.from("tnmm_ocr_runs").update({ status: "done", pages, updated_at: new Date().toISOString() }).eq("id", runId);
+  } catch (e) {
+    await db.from("tnmm_ocr_runs").update({ status: "error", error: String((e as any)?.message || e).slice(0, 400), updated_at: new Date().toISOString() }).eq("id", runId);
+  } finally {
+    if (fileId) await fetch(`${MISTRAL}/files/${fileId}`, { method: "DELETE", headers: auth }).catch(() => {});
+  }
 }
 
 const ADJ_KEYS = ["less_interest", "less_dividend", "adj_invest_disposal", "adj_invest_fv", "less_rental_nonop",
@@ -149,23 +181,27 @@ Deno.serve(async (req) => {
     }
 
     if (action === "ocr") {
-      // the file arrives as the raw request body and is never stored
+      // the file arrives as the raw request body; it is not kept after OCR
       const mime = (req.headers.get("Content-Type") || "").split(";")[0].trim();
       if (!OCR_TYPES.test(mime)) return json({ error: "This file type cannot be read. Use PDF, Word, PowerPoint, an image, Excel or CSV." }, 415);
       const bytes = new Uint8Array(await req.arrayBuffer());
       if (!bytes.length) return json({ error: "The file was empty." }, 400);
       if (bytes.length > MAX_FILE) return json({ error: "The file is over 20 MB. Upload only the financial statements pages." }, 413);
-      const document = mime.startsWith("image/")
-        ? { type: "image_url", image_url: `data:${mime};base64,${b64(bytes)}` }
-        : { type: "document_url", document_url: `data:${mime};base64,${b64(bytes)}` };
-      const r = await fetch(`${MISTRAL}/ocr`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({ model: OCR_MODEL, document, include_image_base64: false }),
-      });
-      if (!r.ok) return json({ error: `Mistral OCR failed (${r.status}): ${(await r.text()).slice(0, 300)}` }, 502);
-      const out = await r.json();
-      return json({ pages: (out.pages || []).map((p: any) => ({ index: p.index, markdown: String(p.markdown || "") })) });
+      const name = decodeURIComponent(req.headers.get("X-File-Name") || "accounts").slice(0, 120);
+      const { data: run, error } = await db.from("tnmm_ocr_runs").insert({ owner: uid, file_name: name }).select("id").single();
+      if (error) throw error;
+      EdgeRuntime.waitUntil(runOcr(db, run.id, bytes, mime, name, key!));
+      return json({ run: run.id });
+    }
+
+    if (action === "ocr_status") {
+      const b = await req.json();
+      if (!UUID.test(String(b.run || ""))) return json({ error: "Bad request." }, 400);
+      const { data, error } = await db.from("tnmm_ocr_runs").select("status,pages,error").eq("id", b.run).eq("owner", uid).maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: "That OCR run was not found." }, 404);
+      if (data.status === "done") await db.from("tnmm_ocr_runs").delete().eq("id", b.run);
+      return json(data);
     }
 
     if (action === "extract") {

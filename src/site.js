@@ -66,7 +66,7 @@
     const raw = body instanceof Blob;
     const r = await fetch(window.TNMM_CONFIG.apiUrl + '?action=' + action, {
       method: 'POST', signal: opts.signal,
-      headers: { Authorization: 'Bearer ' + (token || ''), apikey: window.TNMM_CONFIG.apiKey, 'Content-Type': raw ? body.type : 'application/json' },
+      headers: { Authorization: 'Bearer ' + (token || ''), apikey: window.TNMM_CONFIG.apiKey, 'Content-Type': raw ? body.type : 'application/json', ...(opts.headers || {}) },
       body: raw ? body : JSON.stringify(body || {})
     });
     const out = await r.json().catch(() => ({}));
@@ -89,7 +89,7 @@
   }
   function showApp() {
     $('#authview').hidden = true; $('.shell').hidden = false; $('#dl').hidden = false; $('#who').hidden = false;
-    $('#whoname').textContent = state.profile.name || state.profile.email || '';
+    $('#whoname').innerHTML = `<b>${esc(state.profile.name || '')}</b><small>${esc(state.profile.email || state.user.email || '')}</small>`;
     render();
   }
   function hideApp() { $('.shell').hidden = true; $('#dl').hidden = true; $('#who').hidden = true; $('#authview').hidden = false; }
@@ -187,7 +187,7 @@
       ${hasFigures(job) ? tilesHtml(R) : ''}
       <div class="tabs" role="tablist">
         ${[['upload', 'Upload & Go'], ['companies', 'Companies', 1 + job.comps.length], ['calc', 'Calculation'], ['reject', 'Rejection', hasFigures(job) && job.comps.length ? accN + '/' + job.comps.length + ' accepted' : undefined], ['results', 'Results']]
-          .map(([k, l, c]) => `<button role="tab" data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${l}${c !== undefined ? `<span class="count">${esc(c)}</span>` : ''}</button>`).join('')}
+          .map(([k, l, c]) => { const ok = stepDone(job, R, k); return `<button role="tab" data-tab="${k}" class="${state.tab === k ? 'on' : ''} ${ok ? 'done' : ''}">${ok ? '<span class="tick" aria-label="done">✓</span>' : ''}${l}${c !== undefined ? `<span class="count">${esc(c)}</span>` : ''}</button>`; }).join('')}
       </div>
       <section id="tabbody">${state.tab === 'upload' ? uploadHtml(job) : state.tab === 'companies' ? companiesHtml(job) : state.tab === 'calc' ? calcHtml(job, R) : state.tab === 'reject' ? rejectHtml(job, R) : resultsHtml(job, R)}</section>`;
     $('#dl').disabled = !job.tp.name && !job.comps.length;
@@ -203,7 +203,8 @@
       <div class="field wide"><label>Comparable period</label><div class="seg" role="group">
         <button data-wmode="6-6" class="${(job.windowMode || '6-6') === '6-6' ? 'on' : ''}">−6 / +6 months</button>
         <button data-wmode="7-5" class="${job.windowMode === '7-5' ? 'on' : ''}">−7 / +5 months</button></div>
-        <small class="meta">${job.windowFrom && job.windowTo ? `Comparable FYE from ${esc(T.fmtMonth(job.windowFrom))} to ${esc(T.fmtMonth(job.windowTo))}` : 'Pick the tested party FYE to set the period'}</small></div>
+        ${job.windowFrom && job.windowTo ? `<div class="row period"><label for="f-wfrom" class="meta">From</label><input id="f-wfrom" type="date" data-fid="wfrom" data-job-field="windowFrom" value="${esc(isoDay(job.windowFrom, false))}">
+          <label for="f-wto" class="meta">to</label><input id="f-wto" type="date" data-fid="wto" data-job-field="windowTo" value="${esc(isoDay(job.windowTo, true))}"></div>` : '<small class="meta">Pick the tested party FYE to set the period</small>'}</div>
       <div class="field"><label for="f-rpt">RPT threshold</label><div class="row"><input id="f-rpt" class="num" data-fid="rpt" data-job-field="rptThreshold" value="${esc(Math.round(T.num(job.rptThreshold) * 100))}" inputmode="decimal"><span>%</span></div></div>
     </div>`;
   }
@@ -401,6 +402,8 @@
     const d = parseFye(job.tp.fye); if (!d) return '';
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
   }
+  /* windows saved before dates were used are 'YYYY-MM'; show them as the first or last day of the month */
+  function isoDay(v, end) { if (!v) return ''; if (/^\d{4}-\d{2}$/.test(v)) { const [y, m] = v.split('-').map(Number); return end ? `${v}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}` : `${v}-01`; } return v; }
   function fmtFye(iso) { const d = new Date(iso + 'T00:00:00'); return isNaN(d) ? '' : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); }
   /* Comparable FYE window: -6/+6 months (MTPG 2024 para 4.7) or -7/+5 months (Example 4.2) around the tested party FYE. */
   function suggestWindow(silent) {
@@ -408,8 +411,8 @@
     if (!d || isNaN(d)) { if (!silent) toast('Pick the tested party FYE first.'); return; }
     const [before, after] = state.job.windowMode === '7-5' ? [7, 5] : [6, 6];
     const from = new Date(d.getFullYear(), d.getMonth() - (before - 1), 1), to = new Date(d.getFullYear(), d.getMonth() + after, 1);
-    const m = x => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0');
-    state.job.windowFrom = m(from); state.job.windowTo = m(to);
+    const day = x => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+    state.job.windowFrom = day(from); state.job.windowTo = day(new Date(to.getFullYear(), to.getMonth() + 1, 0));
     if (silent) return;
     touch(); render();
   }
@@ -492,9 +495,18 @@
       if (!pages) {
         const fm = fileMode(f.file);
         if (fm.mode === 'ocr') {
-          setBusy(id, 'Uploading and running OCR on every page. Large scans can take a minute…', 0.25);
-          const o = await api('ocr', new Blob([f.file], { type: fm.mime }), { signal: ctl.signal });
-          pages = o.pages || [];
+          setBusy(id, 'Uploading the file…', 0.15);
+          const st = await api('ocr', new Blob([f.file], { type: fm.mime }), { signal: ctl.signal, headers: { 'X-File-Name': encodeURIComponent(f.name) } });
+          const t0 = Date.now();
+          for (;;) {
+            await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
+            const secs = Math.round((Date.now() - t0) / 1000);
+            setBusy(id, `Running OCR on every page (${secs}s). Scanned accounts can take a few minutes…`, Math.min(0.55, 0.2 + secs / 400));
+            const r = await api('ocr_status', { run: st.run }, { signal: ctl.signal });
+            if (r.status === 'done') { pages = r.pages || []; break; }
+            if (r.status === 'error') throw new Error(r.error || 'OCR failed. Try again.');
+            if (secs > 600) throw new Error('OCR is taking too long. Try a smaller file with only the financial statements pages.');
+          }
         } else {
           setBusy(id, 'Reading the spreadsheet…', 0.3);
           pages = await localPages(f.file);
@@ -505,7 +517,7 @@
       const ranked = pages.map((p, i) => ({ p, s: scorePage(p.markdown, i) })).filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 14).map(x => x.p);
       const pick = (ranked.length ? ranked : pages.slice(0, 14)).sort((a, b) => a.index - b.index);
       setBusy(id, `Mapping figures from page${pick.length === 1 ? '' : 's'} ${pick.map(p => p.index + 1).join(', ')}…`, 0.65);
-      const win = job.windowFrom && job.windowTo ? `between ${T.fmtMonth(job.windowFrom)} and ${T.fmtMonth(job.windowTo)}` : '';
+      const win = job.windowFrom && job.windowTo ? `between ${fmtFye(isoDay(job.windowFrom, false))} and ${fmtFye(isoDay(job.windowTo, true))}` : '';
       const out = await api('extract', { pages: pick, role: c.isTested ? 'tested' : 'comparable', fye: job.tp.fye, window: win, kind: c.docKind === 'management' ? 'management' : 'audited' }, { signal: ctl.signal });
       applyExtraction(c, out.result, pick.map(p => p.index + 1));
       delete state.errors[id];
@@ -533,6 +545,18 @@
     if (!failed) state.tab = 'results';
     render();
     toast(failed ? `${ids.length - failed} read, ${failed} could not be read. See the list for details.` : 'All figures read. Check them in Companies and Calculation.');
+  }
+  /* A step is done when: files all read (Upload), every company has figures (Companies), every PBT check that was entered agrees
+     (Calculation), at least one comparable is accepted (Rejection), and a range exists (Results). */
+  function stepDone(job, R, k) {
+    const all = [job.tp, ...job.comps];
+    const filled = job.comps.length > 0 && all.every(c => T.num(c.pl.rev) !== 0);
+    if (k === 'upload') return filled && !all.some(c => state.files[c.id] && !(c.extraction && c.extraction.at)) && !Object.keys(state.errors).length;
+    if (k === 'companies') return filled;
+    if (k === 'calc') return filled && all.every(c => T.calcCompany(c).pbtCheck !== false);
+    if (k === 'reject') return filled && R.acc.length > 0;
+    if (k === 'results') return filled && R.stat.om.n > 0 && R.stat.om.lo !== null;
+    return false;
   }
   function hasFigures(job) { return T.num(job.tp.pl.rev) !== 0 || job.comps.some(c => T.num(c.pl.rev) !== 0); }
   function queueRow(c) {
