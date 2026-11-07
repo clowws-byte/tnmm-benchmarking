@@ -418,10 +418,10 @@
   }
   function parseFye(s) { if (!s) return null; const d = new Date(String(s).replace(/(\d+)(st|nd|rd|th)/, '$1')); return isNaN(d) ? null : d; }
 
-  /* ---------------- files & extraction (Mistral OCR via the tnmm-ocr Edge Function) ---------------- */
+  /* ---------------- files & extraction (read in the browser; Gemini on the server as fallback) ---------------- */
   const EXT_MIME = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif',
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
-  /* How a file is read: 'ocr' (sent to Mistral OCR), 'sheet' (Excel, read here), 'text' (CSV / text, read here). */
+  /* How a file is read: 'ocr' (read in the browser, else server OCR), 'sheet' (Excel, read here), 'text' (CSV / text, read here). */
   function fileMode(f) {
     const ext = (f.name.split('.').pop() || '').toLowerCase();
     if (EXT_MIME[ext]) return { mode: 'ocr', mime: EXT_MIME[ext] };
@@ -506,7 +506,7 @@
   /* ---------- Free reading in the browser ----------
      1) Digital PDFs: read the text layer with pdf.js (exact, instant, free).
      2) Scanned pages / images: free OCR with Tesseract.js, in the browser.
-     Returns null when the result looks too poor, so the caller can fall back to Mistral OCR. */
+     Returns null when the result looks too poor, so the caller can fall back to server OCR (Gemini). */
   const LIB = {
     pdf: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
     pdfWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
@@ -603,11 +603,11 @@
       return pages.length ? pages : null;
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
-      console.warn('Free reading failed, using Mistral OCR instead:', e);
+      console.warn('Free reading failed, using server OCR instead:', e);
       return null;
     }
   }
-  /* Paid fallback: Mistral OCR on the server (used only when the free reading in the browser isn't good enough). */
+  /* Paid fallback: OCR on the server (Gemini) (used only when the free reading in the browser isn't good enough). */
   async function serverOcr(id, f, fm, ctl) {
     setBusy(id, 'Checking the file…', 0.08);
     const buf = await f.file.arrayBuffer();

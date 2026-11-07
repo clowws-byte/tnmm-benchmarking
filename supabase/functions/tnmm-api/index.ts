@@ -1,7 +1,7 @@
 // TNMM Benchmarking API (Transfer Pricing project).
 // Staff sign in through the CCTaxLab portal; this function verifies that sign-in with CCTaxLab and
 // checks the person can see the TNMM application there (portal visibility rules and Access grants).
-// Jobs live in public.tnmm_jobs here; Mistral OCR runs here with the MISTRAL_API_KEY secret.
+// Jobs live in public.tnmm_jobs here. AI reading uses Google Gemini (GEMINI_API_KEY); Mistral is an optional fallback.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
@@ -13,7 +13,11 @@ const MISTRAL = "https://api.mistral.ai/v1";
 const OCR_MODEL = Deno.env.get("MISTRAL_OCR_MODEL") ?? "mistral-ocr-latest";
 const CHAT_MODEL = Deno.env.get("MISTRAL_CHAT_MODEL") ?? "mistral-large-latest";
 const MAX_FILE = 50 * 1024 * 1024;
-// PDFs, Word, PowerPoint and images go to Mistral OCR; spreadsheets and text are read in the browser.
+// Google Gemini (preferred when its key is set). Accepts any of these secret names.
+const GEMINI_KEY = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY", "GEMINI_KEY"].map(n => Deno.env.get(n)).find(Boolean) || "";
+const GEMINI = "https://generativelanguage.googleapis.com";
+const GEMINI_MODELS = [Deno.env.get("GEMINI_MODEL"), "gemini-flash-latest", "gemini-2.5-flash"].filter(Boolean) as string[];
+// File types the server can OCR (only used when reading in the browser fails).
 const OCR_TYPES = /^(application\/pdf|image\/(png|jpeg|webp|gif|avif)|application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|presentationml\.presentation))$/;
 
 const CORS = {
@@ -46,11 +50,11 @@ async function identify(token: string) {
 }
 
 /* OCR runs in the background (a scanned PDF can take longer than one request may stay open).
-   The browser uploads the file straight to private Storage (tnmm-uploads/<user>/<run>); Mistral reads it
-   through a 10-minute signed link, and the file is deleted as soon as OCR finishes. */
+   The browser uploads the file straight to private Storage (tnmm-uploads/<user>/<run>); Gemini (or Mistral)
+   reads it, and the file is deleted as soon as OCR finishes. */
 const BUCKET = "tnmm-uploads";
-/* Call Mistral, waiting and retrying when it answers 429 (rate limited) or 5xx. A rejected call is not billed. */
-async function mistralFetch(url: string, init: RequestInit, tries = 4) {
+/* Call an AI API, waiting and retrying when it answers 429 (rate limited) or 5xx. A rejected call is not billed. */
+async function retryFetch(url: string, init: RequestInit, tries = 4) {
   let wait = 4000;
   for (let i = 1; ; i++) {
     const r = await fetch(url, init);
@@ -66,16 +70,92 @@ function mistralError(what: string, status: number, text: string) {
   if (status === 401) return "Mistral rejected the API key. Check MISTRAL_API_KEY in Supabase Edge Function secrets.";
   return `${what} failed (${status}): ${text.slice(0, 200)}`;
 }
+/* ---- Gemini ---- */
+function geminiError(what: string, status: number, text: string) {
+  if (status === 429) return "Google Gemini is refusing requests on your key (quota or rate limit). Check the key's quota and billing in Google AI Studio, then try again.";
+  if (status === 400 && /API key not valid|API_KEY_INVALID/i.test(text)) return "Google rejected the Gemini API key. Check the key saved in Supabase Edge Function secrets.";
+  if (status === 403) return "The Gemini API key is not allowed to use this API. In Google AI Studio, check the key and that the Generative Language API is enabled.";
+  return `${what} failed (${status}): ${text.slice(0, 200)}`;
+}
+async function geminiGenerate(parts: any[], json: boolean, maxTokens = 8192) {
+  let last: Response | null = null;
+  for (const model of GEMINI_MODELS) {
+    const r = await retryFetch(`${GEMINI}/v1beta/models/${model}:generateContent`, {
+      method: "POST", headers: { "x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts }],
+        generationConfig: { temperature: 0, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) } }),
+    });
+    if (r.status === 404) { last = r; await r.body?.cancel(); continue; } // model name not available: try the next one
+    if (!r.ok) return { error: geminiError("Gemini", r.status, await r.text()) };
+    const out = await r.json();
+    const text = (out.candidates?.[0]?.content?.parts || []).map((p: any) => p.text || "").join("");
+    if (!text) return { error: "Gemini returned no text (" + (out.candidates?.[0]?.finishReason || out.promptFeedback?.blockReason || "empty") + ")." };
+    return { text, model };
+  }
+  return { error: `No Gemini model was available (${last?.status}). Set GEMINI_MODEL in Supabase secrets to a model your key can use.` };
+}
+/* Upload a file to the Gemini Files API (resumable protocol) and wait until it can be used. */
+async function geminiUpload(bytes: Uint8Array, mime: string, name: string) {
+  const start = await fetch(`${GEMINI}/upload/v1beta/files`, {
+    method: "POST",
+    headers: { "x-goog-api-key": GEMINI_KEY, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+      "X-Goog-Upload-Header-Content-Length": String(bytes.length), "X-Goog-Upload-Header-Content-Type": mime, "Content-Type": "application/json" },
+    body: JSON.stringify({ file: { display_name: name.slice(0, 100) } }),
+  });
+  if (!start.ok) throw new Error(geminiError("Upload to Gemini", start.status, await start.text()));
+  const url = start.headers.get("x-goog-upload-url");
+  await start.body?.cancel();
+  if (!url) throw new Error("Gemini did not return an upload link.");
+  const up = await fetch(url, { method: "POST", headers: { "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize", "Content-Length": String(bytes.length) }, body: bytes });
+  if (!up.ok) throw new Error(geminiError("Upload to Gemini", up.status, await up.text()));
+  let file = (await up.json()).file;
+  for (let i = 0; file?.state === "PROCESSING" && i < 30; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const g = await fetch(`${GEMINI}/v1beta/${file.name}`, { headers: { "x-goog-api-key": GEMINI_KEY } });
+    if (g.ok) file = await g.json();
+  }
+  if (!file?.uri || file.state === "FAILED") throw new Error("Gemini could not process the file.");
+  return file as { name: string; uri: string };
+}
+const TRANSCRIBE = `Transcribe this document to Markdown, page by page, exactly as printed. Start every page with a line "=== PAGE n ===" (n = page number in the file, starting at 1).
+For the financial statements (statements of financial position, profit or loss, changes in equity, cash flows) and all notes to the financial statements, copy every word and figure; write tables as Markdown tables keeping the year columns.
+For other pages (cover, contents, directors' report, auditors' report, statutory declaration), write only the page heading.
+Do not add commentary.`;
+async function runOcrGemini(db: any, runId: string, path: string, mime: string) {
+  const { data: blob, error } = await db.storage.from(BUCKET).download(path);
+  if (error || !blob) throw new Error("The uploaded file was not found. Upload it again.");
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const file = await geminiUpload(bytes, mime, path.split("/").pop() || "accounts");
+  try {
+    const g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: TRANSCRIBE }], false, 65536);
+    if (g.error) throw new Error(g.error);
+    const parts = g.text!.split(/^=== PAGE (\d+) ===\s*$/m);
+    const pages: { index: number; markdown: string }[] = [];
+    for (let i = 1; i < parts.length; i += 2) pages.push({ index: Number(parts[i]) - 1, markdown: parts[i + 1].trim() });
+    return pages.length ? pages : [{ index: 0, markdown: g.text! }];
+  } finally {
+    await fetch(`${GEMINI}/v1beta/${file.name}`, { method: "DELETE", headers: { "x-goog-api-key": GEMINI_KEY } }).catch(() => {});
+  }
+}
+
 async function runOcr(db: any, runId: string, path: string, mime: string, key: string) {
   const t0 = Date.now();
   try {
+    if (GEMINI_KEY && (mime === "application/pdf" || mime.startsWith("image/"))) {
+      console.log(`ocr ${runId}: Gemini`);
+      const pages = await runOcrGemini(db, runId, path, mime);
+      await db.from("tnmm_ocr_runs").update({ status: "done", pages, page_count: pages.length, updated_at: new Date().toISOString() }).eq("id", runId);
+      console.log(`ocr ${runId}: done, ${pages.length} pages in ${Date.now() - t0} ms`);
+      return;
+    }
+    if (!key) throw new Error("Word and PowerPoint files need Mistral OCR, which is not set up. Save the file as PDF and upload again.");
     const { data: signed, error: se } = await db.storage.from(BUCKET).createSignedUrl(path, 600);
     if (se || !signed?.signedUrl) throw new Error("The uploaded file was not found. Upload it again.");
     const document = mime.startsWith("image/")
       ? { type: "image_url", image_url: signed.signedUrl }
       : { type: "document_url", document_url: signed.signedUrl };
     console.log(`ocr ${runId}: calling Mistral`);
-    const r = await mistralFetch(`${MISTRAL}/ocr`, {
+    const r = await retryFetch(`${MISTRAL}/ocr`, {
       method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: OCR_MODEL, document, include_image_base64: false }),
     });
@@ -147,7 +227,7 @@ Deno.serve(async (req) => {
   const action = new URL(req.url).searchParams.get("action") ?? "";
 
   if (action === "me") {
-    return json({ ok: !who.error, reason: who.error ?? null,
+    return json({ ok: !who.error, reason: who.error ?? null, ai: GEMINI_KEY ? "gemini" : Deno.env.get("MISTRAL_API_KEY") ? "mistral" : "none",
       profile: who.profile ? { name: who.profile.full_name, email: who.profile.email, admin: !!who.profile.is_admin, branch: who.profile.branch } : null });
   }
   if (who.error) {
@@ -186,9 +266,9 @@ Deno.serve(async (req) => {
       return json({ ok: true });
     }
 
-    const key = Deno.env.get("MISTRAL_API_KEY");
+    const key = Deno.env.get("MISTRAL_API_KEY") || "";
     if (action === "ocr_start" || action === "ocr_go" || action === "extract") {
-      if (!key) return json({ error: "The OCR key is not set up yet. An admin needs to add MISTRAL_API_KEY in Supabase Edge Function secrets." }, 503);
+      if (!key && !GEMINI_KEY) return json({ error: "No AI key is set up. An admin needs to add GEMINI_API_KEY (or MISTRAL_API_KEY) in Supabase Edge Function secrets." }, 503);
     }
 
     if (action === "ocr_start") {
@@ -227,7 +307,7 @@ Deno.serve(async (req) => {
       const { data: started } = await db.from("tnmm_ocr_runs").update({ status: "running", created_at: new Date().toISOString(), updated_at: new Date().toISOString() })
         .eq("id", b.run).eq("owner", uid).eq("status", "waiting").select("id,mime");
       if (!started?.length) return json({ ok: true, already: true });
-      EdgeRuntime.waitUntil(runOcr(db, b.run, `${uid}/${b.run}`, started[0].mime, key!));
+      EdgeRuntime.waitUntil(runOcr(db, b.run, `${uid}/${b.run}`, started[0].mime, key));
       return json({ ok: true });
     }
 
@@ -252,7 +332,17 @@ Deno.serve(async (req) => {
         .map((p: any) => ({ index: Number(p.index) || 0, markdown: String(p.markdown || "").slice(0, 40000) }));
       if (!pages.length) return json({ error: "No pages were sent." }, 400);
       const ctx = { role: b.role === "tested" ? "tested" : "comparable", fye: String(b.fye || ""), window: String(b.window || ""), kind: b.kind === "management" ? "management" : "any" };
-      const r = await mistralFetch(`${MISTRAL}/chat/completions`, {
+      if (GEMINI_KEY) {
+        const g = await geminiGenerate([{ text: extractPrompt(ctx, pages) }], true, 16384);
+        if (g.error) return json({ error: g.error }, 502);
+        let result: any = null;
+        try { result = JSON.parse(g.text!); } catch { const m = String(g.text).match(/\{[\s\S]*\}/); if (m) try { result = JSON.parse(m[0]); } catch { /* fallthrough */ } }
+        if (Array.isArray(result)) result = result[0];
+        if (!result || !result.pl) return json({ error: "The figures could not be read from the answer. Try again." }, 502);
+        result.adjustments = (result.adjustments || []).filter((a: any) => a && ADJ_KEYS.includes(a.key));
+        return json({ result, model: g.model });
+      }
+      const r = await retryFetch(`${MISTRAL}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body: JSON.stringify({ model: CHAT_MODEL, temperature: 0, response_format: { type: "json_object" },
