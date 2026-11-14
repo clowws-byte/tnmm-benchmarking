@@ -126,11 +126,18 @@ async function geminiUpload(bytes: Uint8Array, mime: string, name: string) {
   if (!file?.uri || file.state === "FAILED") throw new Error("Gemini could not process the file.");
   return file as { name: string; uri: string };
 }
-const TRANSCRIBE = `Transcribe this document to Markdown, page by page, exactly as printed. Start every page with a line "=== PAGE n ===" (n = page number in the file, starting at 1).
-For the financial statements (statements of financial position, profit or loss, changes in equity, cash flows) and all notes to the financial statements, copy every word and figure; write tables as Markdown tables keeping the year columns.
-For other pages (cover, contents, directors' report, auditors' report, statutory declaration), write only the page heading.
-Do not add commentary.`;
-/* Used when Google blocks the word-for-word transcript (RECITATION): figures in tables, narrative in own words. */
+/* Read only what the TNMM calculation uses. Gemini still sees every page, but writes out only these parts,
+   so a run takes a fraction of the time of a full transcript and avoids copying standard policy wording
+   (which is what trips Google's RECITATION block). */
+const TARGETED = `You are collecting figures from a Malaysian company's financial statements for a transfer pricing (TNMM) benchmark.
+Write out ONLY the parts listed below. Put each page you use under a line "=== PAGE n ===" (n = page number in the file, starting at 1), in page order.
+1. Company name, registration number and financial year end (cover or first pages).
+2. Principal activities: one short line (directors' report or note 1).
+3. The statement of profit or loss (and other comprehensive income): every line item and every figure, all year columns.
+4. These notes only, with the note number and heading: revenue; cost of sales; other income / other operating income; finance costs; interest or finance income; profit before taxation ("arrived at after charging / crediting"); employee benefits or staff costs; investment properties (only depreciation and rental income); related party transactions (only the transactions and their amounts); income tax expense (only the tax expense lines).
+Write every amount in Markdown tables: one row per line item with the item name as printed, one column per financial year headed by its year-end date. Keep brackets for negatives and state the unit (RM or RM'000) as printed.
+Skip everything else: auditors' report, directors' statements, statutory declaration, statement of financial position, changes in equity, cash flows, accounting policies and all other notes. Do not copy narrative sentences; where a note needs explaining, add one short line in your own words. No commentary.`;
+/* Used when Google blocks the targeted read (RECITATION): figures in tables only, narrative in own words. */
 const FIGURES_ONLY = `Read this company's financial statements and write a Markdown data sheet, page by page. Start every page you cover with a line "=== PAGE n ===" (n = page number in the file, starting at 1).
 Cover only: the cover or first page (company name and registration number), the principal activities, the statement of profit or loss / comprehensive income, and the notes on revenue, cost of sales, other income, finance costs, profit before tax ("after charging / crediting"), taxation and related party transactions.
 Put every amount in Markdown tables: one row per line item, the line item as printed, and one column per financial year with the year-end date as the column heading. Keep brackets for negative amounts and keep the RM or RM'000 unit.
@@ -142,10 +149,10 @@ async function runOcrGemini(db: any, runId: string, path: string, mime: string) 
   const bytes = new Uint8Array(await blob.arrayBuffer());
   const file = await geminiUpload(bytes, mime, path.split("/").pop() || "accounts");
   try {
-    let g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: TRANSCRIBE }], false, 65536);
+    let g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: TARGETED }], false, 16384);
     if (g.reason === "RECITATION") {
-      console.log(`ocr ${runId}: transcript blocked (RECITATION), retrying with figures only`);
-      g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: FIGURES_ONLY }], false, 32768);
+      console.log(`ocr ${runId}: targeted read blocked (RECITATION), retrying with figures only`);
+      g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: FIGURES_ONLY }], false, 16384);
     }
     if (g.error) { const e: any = new Error(g.error); e.recitation = g.reason === "RECITATION"; throw e; }
     const parts = g.text!.split(/^=== PAGE (\d+) ===\s*$/m);
@@ -169,7 +176,7 @@ async function runOcr(db: any, runId: string, path: string, mime: string, key: s
         return;
       } catch (e) {
         if (!(e as any)?.recitation) throw e;
-        // Google blocked both requests (full transcript and figures only): use Mistral OCR if it is set up (it has no such filter)
+        // Google blocked both requests (targeted read and figures only): use Mistral OCR if it is set up (it has no such filter)
         if (!key) throw new Error("Google Gemini would not transcribe this file (RECITATION: it matches published text). Upload only the pages needed (profit or loss statement, profit before tax note, related party note, cover page), or enter the figures by hand.");
         console.log(`ocr ${runId}: Gemini blocked (RECITATION), falling back to Mistral OCR`);
       }
@@ -362,7 +369,7 @@ Deno.serve(async (req) => {
       if (!pages.length) return json({ error: "No pages were sent." }, 400);
       const ctx = { role: b.role === "tested" ? "tested" : "comparable", fye: String(b.fye || ""), window: String(b.window || ""), kind: b.kind === "management" ? "management" : "any" };
       if (GEMINI_KEY) {
-        const g = await geminiGenerate([{ text: extractPrompt(ctx, pages) }], true, 16384);
+        const g = await geminiGenerate([{ text: extractPrompt(ctx, pages) }], true, 8192);
         if (g.error) return json({ error: g.error }, 502);
         let result: any = null;
         try { result = JSON.parse(g.text!); } catch { const m = String(g.text).match(/\{[\s\S]*\}/); if (m) try { result = JSON.parse(m[0]); } catch { /* fallthrough */ } }
