@@ -515,7 +515,9 @@
     if (i < 3 && /(registration no|company no|\(\d{5,7}-[a-z]\))/.test(t)) s += 5;
     if (/principal activit/.test(t)) s += 4;
     if (/statements? of financial position/.test(t) && s < 10) s -= 2;
-    if (/statements? of (changes in equity|cash flows)/.test(t) && s < 10) s -= 3;
+    if (/statements? of changes in equity/.test(t) && s < 10) s -= 3;
+    // the cash flow statement's "adjustments for" lines show interest, dividends, investment gains, forex and impairment
+    if (/statements? of cash flows?|cash flows? (from|used in) operating/.test(t)) s += /adjustments? for/.test(t) ? 7 : 2;
     return s;
   }
   // Upload straight to private Storage with a one-time link (shows progress; does not pass through the API).
@@ -538,6 +540,10 @@
   /* Text already read from a file is kept in this browser for 14 days (keyed by the file's fingerprint),
      so reading the same file again, even after a refresh, is instant and costs no new OCR. */
   const CACHE_MS = 14 * 86400000; // 14 days
+  /* Change when the server's reading instructions change, so files are read once more instead of reusing old text.
+     v2: targeted read of the sections the calculation uses, including the statement of cash flows. */
+  const READ_VERSION = 'v2';
+  const sha256hex = async buf => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
   const IDB = { db: null };
   function idb() {
     return IDB.db || (IDB.db = new Promise((res, rej) => {
@@ -570,7 +576,8 @@
   async function serverOcr(id, f, fm, ctl) {
     setBusy(id, 'Checking the file…', 0.08);
     const buf = await f.file.arrayBuffer();
-    const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
+    // the server reuses earlier reads by this fingerprint, so it includes the read version
+    const hash = await sha256hex(new TextEncoder().encode(await sha256hex(buf) + ':' + READ_VERSION));
     const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash, why: 'Gemini OCR (direct)' }, { signal: ctl.signal });
     if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
     else {
@@ -594,7 +601,7 @@
     const ctl = new AbortController(); state.aborts[id] = ctl;
     try {
       let pages = state.ocr[id] ? state.ocr[id].pages : null;
-      const key = pages ? null : await fileKey(f.file).then(k => 'gemini:' + k).catch(() => null);
+      const key = pages ? null : await fileKey(f.file).then(k => 'gemini-' + READ_VERSION + ':' + k).catch(() => null);
       if (!pages && key) { pages = await cacheGet(key); if (pages) { setBusy(id, 'Already read on this computer. Using the saved text…', 0.6); state.ocr[id] = { file: f.name, pages }; } }
       if (!pages) {
         const fm = fileMode(f.file);
