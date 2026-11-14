@@ -77,7 +77,7 @@ function geminiError(what: string, status: number, text: string) {
   if (status === 403) return "The Gemini API key is not allowed to use this API. In Google AI Studio, check the key and that the Generative Language API is enabled.";
   return `${what} failed (${status}): ${text.slice(0, 200)}`;
 }
-async function geminiGenerate(parts: any[], json: boolean, maxTokens = 8192) {
+async function geminiGenerate(parts: any[], json: boolean, maxTokens = 8192): Promise<{ text?: string; model?: string; error?: string; reason?: string }> {
   let last: Response | null = null, lastErr = "";
   for (const model of GEMINI_MODELS) {
     const r = await retryFetch(`${GEMINI}/v1beta/models/${model}:generateContent`, {
@@ -94,7 +94,11 @@ async function geminiGenerate(parts: any[], json: boolean, maxTokens = 8192) {
     }
     const out = await r.json();
     const text = (out.candidates?.[0]?.content?.parts || []).map((p: any) => p.text || "").join("");
-    if (!text) return { error: "Gemini returned no text (" + (out.candidates?.[0]?.finishReason || out.promptFeedback?.blockReason || "empty") + ")." };
+    const reason = String(out.candidates?.[0]?.finishReason || out.promptFeedback?.blockReason || "empty");
+    // RECITATION: Google stops output that repeats published text word for word. Partial text is not trusted.
+    // The other model is blocked the same way, so return at once and let the caller change the request.
+    if (reason === "RECITATION") { console.log(`gemini ${model}: RECITATION`); return { error: "Gemini returned no text (RECITATION).", reason }; }
+    if (!text) return { error: "Gemini returned no text (" + reason + ").", reason };
     return { text, model };
   }
   return { error: last?.status === 429 ? lastErr : `No Gemini model was available (${last?.status}). Set GEMINI_MODEL in Supabase secrets to a model your key can use.` };
@@ -126,14 +130,24 @@ const TRANSCRIBE = `Transcribe this document to Markdown, page by page, exactly 
 For the financial statements (statements of financial position, profit or loss, changes in equity, cash flows) and all notes to the financial statements, copy every word and figure; write tables as Markdown tables keeping the year columns.
 For other pages (cover, contents, directors' report, auditors' report, statutory declaration), write only the page heading.
 Do not add commentary.`;
+/* Used when Google blocks the word-for-word transcript (RECITATION): figures in tables, narrative in own words. */
+const FIGURES_ONLY = `Read this company's financial statements and write a Markdown data sheet, page by page. Start every page you cover with a line "=== PAGE n ===" (n = page number in the file, starting at 1).
+Cover only: the cover or first page (company name and registration number), the principal activities, the statement of profit or loss / comprehensive income, and the notes on revenue, cost of sales, other income, finance costs, profit before tax ("after charging / crediting"), taxation and related party transactions.
+Put every amount in Markdown tables: one row per line item, the line item as printed, and one column per financial year with the year-end date as the column heading. Keep brackets for negative amounts and keep the RM or RM'000 unit.
+Do not copy sentences or accounting policy wording. Where a note has narrative, summarise it in one short line in your own words.
+Skip all other pages. Do not add commentary.`;
 async function runOcrGemini(db: any, runId: string, path: string, mime: string) {
   const { data: blob, error } = await db.storage.from(BUCKET).download(path);
   if (error || !blob) throw new Error("The uploaded file was not found. Upload it again.");
   const bytes = new Uint8Array(await blob.arrayBuffer());
   const file = await geminiUpload(bytes, mime, path.split("/").pop() || "accounts");
   try {
-    const g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: TRANSCRIBE }], false, 65536);
-    if (g.error) throw new Error(g.error);
+    let g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: TRANSCRIBE }], false, 65536);
+    if (g.reason === "RECITATION") {
+      console.log(`ocr ${runId}: transcript blocked (RECITATION), retrying with figures only`);
+      g = await geminiGenerate([{ file_data: { mime_type: mime, file_uri: file.uri } }, { text: FIGURES_ONLY }], false, 32768);
+    }
+    if (g.error) { const e: any = new Error(g.error); e.recitation = g.reason === "RECITATION"; throw e; }
     const parts = g.text!.split(/^=== PAGE (\d+) ===\s*$/m);
     const pages: { index: number; markdown: string }[] = [];
     for (let i = 1; i < parts.length; i += 2) pages.push({ index: Number(parts[i]) - 1, markdown: parts[i + 1].trim() });
@@ -148,10 +162,17 @@ async function runOcr(db: any, runId: string, path: string, mime: string, key: s
   try {
     if (GEMINI_KEY && (mime === "application/pdf" || mime.startsWith("image/"))) {
       console.log(`ocr ${runId}: Gemini`);
-      const pages = await runOcrGemini(db, runId, path, mime);
-      await db.from("tnmm_ocr_runs").update({ status: "done", pages, page_count: pages.length, updated_at: new Date().toISOString() }).eq("id", runId);
-      console.log(`ocr ${runId}: done, ${pages.length} pages in ${Date.now() - t0} ms`);
-      return;
+      try {
+        const pages = await runOcrGemini(db, runId, path, mime);
+        await db.from("tnmm_ocr_runs").update({ status: "done", pages, page_count: pages.length, updated_at: new Date().toISOString() }).eq("id", runId);
+        console.log(`ocr ${runId}: done, ${pages.length} pages in ${Date.now() - t0} ms`);
+        return;
+      } catch (e) {
+        if (!(e as any)?.recitation) throw e;
+        // Google blocked both requests (full transcript and figures only): use Mistral OCR if it is set up (it has no such filter)
+        if (!key) throw new Error("Google Gemini would not transcribe this file (RECITATION: it matches published text). Upload only the pages needed (profit or loss statement, profit before tax note, related party note, cover page), or enter the figures by hand.");
+        console.log(`ocr ${runId}: Gemini blocked (RECITATION), falling back to Mistral OCR`);
+      }
     }
     if (!key) throw new Error("Word and PowerPoint files need Mistral OCR, which is not set up. Save the file as PDF and upload again.");
     const { data: signed, error: se } = await db.storage.from(BUCKET).createSignedUrl(path, 600);
