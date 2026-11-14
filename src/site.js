@@ -12,7 +12,7 @@
   const state = {
     jobs: [], job: null, tab: 'upload', isExample: false, going: false, errors: {},
     sb: null, user: null, profile: null, ocr: {},
-    saveState: 'idle', files: {}, busy: {}, aborts: {}, why: {}
+    saveState: 'idle', files: {}, busy: {}, aborts: {}
   };
 
   /* ---------------- persistence ---------------- */
@@ -418,10 +418,10 @@
   }
   function parseFye(s) { if (!s) return null; const d = new Date(String(s).replace(/(\d+)(st|nd|rd|th)/, '$1')); return isNaN(d) ? null : d; }
 
-  /* ---------------- files & extraction (read in the browser; Gemini on the server as fallback) ---------------- */
+  /* ---------------- files & extraction (PDFs, images, Word and PowerPoint are read by Gemini OCR on the server) ---------------- */
   const EXT_MIME = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif',
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
-  /* How a file is read: 'ocr' (read in the browser, else server OCR), 'sheet' (Excel, read here), 'text' (CSV / text, read here). */
+  /* How a file is read: 'ocr' (Gemini OCR on the server), 'sheet' (Excel, read here), 'text' (CSV / text, read here). */
   function fileMode(f) {
     const ext = (f.name.split('.').pop() || '').toLowerCase();
     if (EXT_MIME[ext]) return { mode: 'ocr', mime: EXT_MIME[ext] };
@@ -517,82 +517,8 @@
     });
   }
 
-  /* ---------- Free reading in the browser ----------
-     1) Digital PDFs: read the text layer with pdf.js (exact, instant, free).
-     2) Scanned pages / images: free OCR with Tesseract.js, in the browser.
-     Returns null when the result looks too poor, so the caller can fall back to server OCR (Gemini). */
-  const LIB = {
-    pdf: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-    pdfWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
-    tess: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js'
-  };
-  const scripts = {};
-  function loadScript(src) {
-    return scripts[src] || (scripts[src] = new Promise((res, rej) => {
-      const el = document.createElement('script'); el.src = src; el.async = true;
-      el.onload = res; el.onerror = () => { delete scripts[src]; rej(new Error('Could not load ' + src)); };
-      document.head.appendChild(el);
-    }));
-  }
-  // A small pool of free OCR workers (2-3, by CPU) so several pages are read at the same time.
-  let poolP = null;
-  function tessPool() {
-    return poolP || (poolP = (async () => {
-      await loadScript(LIB.tess);
-      const n = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 2) / 2)));
-      const ws = await Promise.all(Array.from({ length: n }, async () => {
-        const w = await window.Tesseract.createWorker('eng');
-        await w.setParameters({ preserve_interword_spaces: '1' });
-        return w;
-      }));
-      const idle = [...ws], waiting = [];
-      return {
-        size: n,
-        async run(fn) {
-          const w = idle.pop() || await new Promise(r => waiting.push(r));
-          try { return await fn(w); } finally { const nx = waiting.shift(); if (nx) nx(w); else idle.push(w); }
-        }
-      };
-    })().catch(e => { poolP = null; throw e; }));
-  }
-  async function ocrPage(doc, i, scale, w) {
-    const page = await doc.getPage(i + 1);
-    const vp = page.getViewport({ scale });
-    const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
-    await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
-    const { data } = await w.recognize(cv);
-    cv.width = cv.height = 0; page.cleanup();
-    return data;
-  }
-  function goodText(t) {
-    const s = String(t || '').replace(/\s/g, '');
-    if (s.length < 60) return false;
-    const ok = (s.match(/[A-Za-z0-9.,()%\-'&:\/]/g) || []).length;
-    return ok / s.length > 0.85;
-  }
-  // rebuild lines (and keep column gaps) from pdf.js text items
-  function linesFromItems(items) {
-    const rows = [];
-    for (const it of items) {
-      if (!it.str || !it.str.trim()) continue;
-      const x = it.transform[4], y = it.transform[5], h = Math.abs(it.transform[3]) || 8;
-      let r = rows.find(r => Math.abs(r.y - y) < Math.max(r.h, h) * 0.5);
-      if (!r) { r = { y, h, items: [] }; rows.push(r); }
-      r.items.push({ x, w: it.width || 0, s: it.str });
-    }
-    rows.sort((a, b) => b.y - a.y);
-    return rows.map(r => {
-      r.items.sort((a, b) => a.x - b.x);
-      let out = '', end = null;
-      for (const t of r.items) {
-        if (end !== null) { const gap = t.x - end; out += gap > r.h * 1.2 ? '    ' : gap > r.h * 0.15 ? ' ' : ''; }
-        out += t.s; end = t.x + t.w;
-      }
-      return out;
-    }).join('\n');
-  }
   /* Text already read from a file is kept in this browser for 3 days (keyed by the file's fingerprint),
-     so reading the same file again, even after a refresh, is instant and free. */
+     so reading the same file again, even after a refresh, is instant and costs no new OCR. */
   const IDB = { db: null };
   function idb() {
     return IDB.db || (IDB.db = new Promise((res, rej) => {
@@ -621,80 +547,12 @@
     const buf = await file.arrayBuffer();
     return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
   }
-  const stopIf = signal => { if (signal.aborted) throw new DOMException('Stopped', 'AbortError'); };
-  async function browserRead(file, mime, id, signal) {
-    try {
-      if (mime.startsWith('image/')) {
-        setBusy(id, 'Free OCR on the image…', 0.2);
-        const pool = await tessPool(); stopIf(signal);
-        const data = await pool.run(async w => (await w.recognize(file)).data);
-        if (data.confidence >= 55 && goodText(data.text)) return [{ index: 0, markdown: data.text }];
-        state.why[id] = `image too unclear for free OCR (confidence ${Math.round(data.confidence)}%)`; return null;
-      }
-      setBusy(id, 'Opening the PDF…', 0.08);
-      await loadScript(LIB.pdf);
-      const pdfjs = window.pdfjsLib; pdfjs.GlobalWorkerOptions.workerSrc = LIB.pdfWorker;
-      const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-      const n = Math.min(doc.numPages, 150);
-      const pages = [], scanned = [], layer = {};
-      for (let i = 0; i < n; i++) {
-        stopIf(signal);
-        const page = await doc.getPage(i + 1);
-        const text = linesFromItems((await page.getTextContent()).items);
-        // a page with only a little text (e.g. a scanner stamp or header over a scanned image) is treated as scanned
-        const chars = text.replace(/\s/g, '').length;
-        if (goodText(text) && chars >= 400) pages.push({ index: i, markdown: text }); else { scanned.push(i); layer[i] = text; }
-        if (i % 5 === 0) setBusy(id, `Reading page ${i + 1} of ${n}…`, 0.08 + 0.1 * i / n);
-      }
-      // digital text already has the profit or loss statement: no need to OCR the odd scanned page (e.g. signatures)
-      const hasPL = pages.some(p => scorePage(p.markdown, p.index) >= 10);
-      if (scanned.length && !hasPL) {
-        /* Scanned: two passes so only the pages that matter get the slow, sharp OCR.
-           Pass 1 reads every scanned page quickly at low resolution just to find the statements and notes.
-           Pass 2 reads the top pages again at high resolution. */
-        const todo = scanned.slice(0, 120), t0 = Date.now();
-        setBusy(id, 'Scanned PDF. Loading free OCR…', 0.2);
-        const pool = await tessPool();
-        const quick = {}; let done = 0;
-        await Promise.all(todo.map(i => pool.run(async w => {
-          stopIf(signal);
-          quick[i] = (await ocrPage(doc, i, 1.5, w)).text || '';
-          done++; setBusy(id, `Free OCR, finding the statements: page ${done} of ${todo.length} (${Math.round((Date.now() - t0) / 1000)}s)…`, 0.2 + 0.2 * done / todo.length);
-        })));
-        const ranked = todo.map(i => ({ i, s: scorePage(quick[i], i) })).sort((a, b) => b.s - a.s);
-        const found = ranked[0] && ranked[0].s >= 5;
-        const sharp = found ? ranked.filter(x => x.s > 0).slice(0, 12).map(x => x.i) : todo.slice(0, 40);
-        let conf = 0, good = 0; done = 0;
-        await Promise.all(sharp.map(i => pool.run(async w => {
-          stopIf(signal);
-          const d = await ocrPage(doc, i, 2, w);
-          if (goodText(d.text)) { quick[i] = d.text; conf += d.confidence || 0; good++; }
-          done++; setBusy(id, `Free OCR, reading the statements: page ${done} of ${sharp.length} (${Math.round((Date.now() - t0) / 1000)}s)…`, 0.4 + 0.2 * done / sharp.length);
-        })));
-        if (!good || conf / good < 50) { state.why[id] = good ? `scan too unclear for free OCR (confidence ${Math.round(conf / good)}%)` : 'no readable text found on the scanned pages'; return null; }
-        todo.forEach(i => { const t = goodText(quick[i]) ? quick[i] : layer[i]; if (goodText(t)) pages.push({ index: i, markdown: t }); });
-        pages.sort((a, b) => a.index - b.index);
-      }
-      // P&L found in the digital text: keep any short pages' own text too (covers, headings)
-      if (hasPL) scanned.forEach(i => { if (goodText(layer[i])) pages.push({ index: i, markdown: layer[i] }); });
-      pages.sort((a, b) => a.index - b.index);
-      doc.destroy();
-      if (!pages.length) state.why[id] = 'no readable text in the PDF';
-      return pages.length ? pages : null;
-    } catch (e) {
-      if (e && e.name === 'AbortError') throw e;
-      console.warn('Free reading failed, using server OCR instead:', e);
-      state.why[id] = 'free reader error: ' + String((e && e.message) || e).slice(0, 120);
-      return null;
-    }
-  }
-  /* Paid fallback: OCR on the server (Gemini) (used only when the free reading in the browser isn't good enough). */
+  /* OCR on the server (Gemini). The file goes to private Storage, is read, then deleted. */
   async function serverOcr(id, f, fm, ctl) {
     setBusy(id, 'Checking the file…', 0.08);
     const buf = await f.file.arrayBuffer();
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
-    const why = state.why[id] || 'server OCR';
-    const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash, why }, { signal: ctl.signal });
+    const st = await api('ocr_start', { name: f.name, mime: fm.mime, size: f.file.size, hash, why: 'Gemini OCR (direct)' }, { signal: ctl.signal });
     if (st.reused) setBusy(id, 'This file was already read today. Reusing that OCR, no new charge…', 0.5);
     else {
       await uploadDirect(st.upload, new Blob([buf], { type: fm.mime }), ctl.signal, pct => setBusy(id, `Uploading the file (${pct}%)…`, 0.08 + pct / 100 * 0.12));
@@ -704,10 +562,10 @@
     for (;;) {
       await new Promise((res, rej) => { const tm = setTimeout(res, 3000); ctl.signal.addEventListener('abort', () => { clearTimeout(tm); rej(new DOMException('Stopped', 'AbortError')); }, { once: true }); });
       const secs = Math.round((Date.now() - t0) / 1000);
-      if (!st.reused) setBusy(id, `Free reading not possible (${why}). Using Gemini OCR (${secs}s)…`, Math.min(0.55, 0.2 + secs / 400));
+      if (!st.reused) setBusy(id, `Reading with Gemini OCR (${secs}s)…`, Math.min(0.55, 0.2 + secs / 400));
       const r = await api('ocr_status', { run: st.run }, { signal: ctl.signal });
       if (r.status === 'done') return r.pages || [];
-      if (r.status === 'error') throw new Error(`Free reading not possible (${why}), and paid OCR failed: ${r.error || 'unknown error'}`);
+      if (r.status === 'error') throw new Error(`Gemini OCR failed: ${r.error || 'unknown error'}`);
       if (secs > 600) throw new Error('OCR is taking too long. Try a smaller file with only the financial statements pages.');
     }
   }
@@ -717,15 +575,11 @@
     const ctl = new AbortController(); state.aborts[id] = ctl;
     try {
       let pages = state.ocr[id] ? state.ocr[id].pages : null;
-      const key = pages ? null : await fileKey(f.file).catch(() => null);
+      const key = pages ? null : await fileKey(f.file).then(k => 'gemini:' + k).catch(() => null);
       if (!pages && key) { pages = await cacheGet(key); if (pages) { setBusy(id, 'Already read on this computer. Using the saved text…', 0.6); state.ocr[id] = { file: f.name, pages }; } }
       if (!pages) {
         const fm = fileMode(f.file);
-        if (fm.mode === 'ocr' && (fm.mime === 'application/pdf' || fm.mime.startsWith('image/'))) {
-          delete state.why[id];
-          pages = await browserRead(f.file, fm.mime, id, ctl.signal);
-          if (!pages) pages = await serverOcr(id, f, fm, ctl);
-        } else if (fm.mode === 'ocr') {
+        if (fm.mode === 'ocr') {
           pages = await serverOcr(id, f, fm, ctl);
         } else {
           setBusy(id, 'Reading the spreadsheet…', 0.3);
