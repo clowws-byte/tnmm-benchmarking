@@ -12,7 +12,7 @@ to a formula-driven Excel workbook (two tabs: Calculation, Summary of Interquart
     The application must be listed in CCTaxLab with a link containing `tnmm-benchmarking`.
   - `tnmm_jobs`: saved jobs keyed by CCTaxLab user id, reached only through the Edge Function.
   - PDFs, images, Word and PowerPoint files are uploaded to private Storage (tnmm-uploads), read by Gemini, then deleted.
-    Excel and CSV files are still read in the browser. Text already read is reused for 14 days (same file, same browser) and for 24 hours on the server, so the same file is not charged twice.
+    Excel and CSV files are still read in the browser. Text already read is reused for 14 days (same file, same browser) and for 14 days on the server (same file, same person), so the same file is not charged twice.
   - Edge Function `tnmm-api`: jobs, OCR, and mapping lines to the TNMM keys with Google Gemini.
     Secret `GEMINI_API_KEY` (also accepted: GOOGLE_API_KEY, GOOGLE_GEMINI_API_KEY, GEMINI_KEY).
     Optional `GEMINI_MODEL` (default gemini-flash-latest, then gemini-2.5-flash). `MISTRAL_API_KEY` is

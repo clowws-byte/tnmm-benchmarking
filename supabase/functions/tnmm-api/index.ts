@@ -17,7 +17,7 @@ const MAX_FILE = 50 * 1024 * 1024;
 const GEMINI_KEY = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY", "GEMINI_KEY"].map(n => Deno.env.get(n)).find(Boolean) || "";
 const GEMINI = "https://generativelanguage.googleapis.com";
 const GEMINI_MODELS = [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-flash-latest", "gemini-flash-lite-latest"].filter(Boolean) as string[])];
-// File types the server can OCR (only used when reading in the browser fails).
+// File types the server can OCR (PDFs and images with Gemini; Word and PowerPoint with Mistral).
 const OCR_TYPES = /^(application\/pdf|image\/(png|jpeg|webp|gif|avif)|application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|presentationml\.presentation))$/;
 
 const CORS = {
@@ -285,7 +285,7 @@ Deno.serve(async (req) => {
       const hash = String(b.hash || "").toLowerCase();
       const size = Number(b.size) || 0;
       const name = String(b.name || "accounts").slice(0, 120);
-      console.log(`ocr_start ${name}: browser reading not used because: ${String(b.why || "").slice(0, 200)}`);
+      console.log(`ocr_start ${name}: ${String(b.why || "").slice(0, 200)}`);
       if (!OCR_TYPES.test(mime)) return json({ error: "This file type cannot be read. Use PDF, Word, PowerPoint, an image, Excel or CSV." }, 415);
       if (!/^[0-9a-f]{64}$/.test(hash)) return json({ error: "Bad request." }, 400);
       if (!size) return json({ error: "The file was empty." }, 400);
@@ -295,7 +295,8 @@ Deno.serve(async (req) => {
         const old = (data || []).filter((o: any) => Date.parse(o.created_at) < Date.now() - 3600000).map((o: any) => `${uid}/${o.name}`);
         if (old.length) return db.storage.from(BUCKET).remove(old);
       }).catch(() => {});
-      const since = new Date(Date.now() - 86400000).toISOString(), fresh = Date.now() - 600000;
+      // reuse an OCR of the same file by the same person from the last 14 days (old runs are purged daily after 14 days)
+      const since = new Date(Date.now() - 14 * 86400000).toISOString(), fresh = Date.now() - 600000;
       const { data: prior } = await db.from("tnmm_ocr_runs").select("id,status,created_at").eq("owner", uid).eq("file_hash", hash)
         .gte("created_at", since).in("status", ["done", "running"]).order("created_at", { ascending: false }).limit(5);
       const reuse = (prior || []).find((r: any) => r.status === "done" || Date.parse(r.created_at) > fresh);
