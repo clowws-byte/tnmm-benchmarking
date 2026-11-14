@@ -1131,8 +1131,9 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     });
   }
 
-  /* Text already read from a file is kept in this browser for 3 days (keyed by the file's fingerprint),
+  /* Text already read from a file is kept in this browser for 14 days (keyed by the file's fingerprint),
      so reading the same file again, even after a refresh, is instant and costs no new OCR. */
+  const CACHE_MS = 14 * 86400000; // 14 days
   const IDB = { db: null };
   function idb() {
     return IDB.db || (IDB.db = new Promise((res, rej) => {
@@ -1145,7 +1146,7 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
     try {
       const db = await idb();
       const v = await new Promise((res, rej) => { const q = db.transaction('pages').objectStore('pages').get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
-      return v && Date.now() - v.at < 3 * 86400000 ? v.pages : null;
+      return v && Date.now() - v.at < CACHE_MS ? v.pages : null;
     } catch (e) { return null; }
   }
   async function cachePut(key, pages) {
@@ -1153,8 +1154,8 @@ svg.strip text{fill:var(--muted);font:11px var(--font-body)}
       const db = await idb();
       const tx = db.transaction('pages', 'readwrite'), st = tx.objectStore('pages');
       st.put({ at: Date.now(), pages }, key);
-      const all = st.openCursor(); // drop entries older than 3 days
-      all.onsuccess = () => { const c = all.result; if (!c) return; if (Date.now() - (c.value.at || 0) > 3 * 86400000) c.delete(); c.continue(); };
+      const all = st.openCursor(); // drop entries older than 14 days
+      all.onsuccess = () => { const c = all.result; if (!c) return; if (Date.now() - (c.value.at || 0) > CACHE_MS) c.delete(); c.continue(); };
     } catch (e) { /* storage not available: just skip the cache */ }
   }
   async function fileKey(file) {
