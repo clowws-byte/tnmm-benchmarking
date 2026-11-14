@@ -25,6 +25,7 @@
     saveTimer = setTimeout(saveNow, 900);
   }
   async function saveNow() {
+    saveTimer = null;
     const job = state.job; if (!job || state.isExample) return;
     if (!state.sb || !state.user) return;
     if (saving) { saveAgain = true; return; }
@@ -115,7 +116,9 @@
     state.jobs = jobs.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     if (firstLoad) {
       firstLoad = false;
-      if (state.jobs.length) openJob(state.jobs[0].id); else startFresh();
+      const back = reopenAfterUpdate();
+      if (back && state.jobs.some(x => x.id === back.id)) { openJob(back.id); if (back.tab) { state.tab = back.tab; render(); } }
+      else if (state.jobs.length) openJob(state.jobs[0].id); else startFresh();
     } else if (state.job && !state.isExample && !saving) {
       // keep the open job; refresh only the list
     }
@@ -776,6 +779,47 @@
   document.addEventListener('dragover', e => { const d = e.target.closest('[data-drop]'); if (d) { e.preventDefault(); d.classList.add('over'); } });
   document.addEventListener('dragleave', e => { const d = e.target.closest('[data-drop]'); if (d) d.classList.remove('over'); });
   document.addEventListener('drop', e => { const d = e.target.closest('[data-drop]'); if (d) { e.preventDefault(); onFile(d.dataset.drop, e.dataTransfer.files); } });
+
+  /* ---------------- automatic update ----------------
+     Every 5 minutes, and whenever the tab is shown again, the published index.html is checked. If its build id
+     differs from this page's, the page reloads itself once it is safe: nothing is being read, every change is
+     saved, no uploaded file is waiting to be read, no dialog is open, and the person has paused for 30 seconds
+     (or the tab is in the background). The open job and tab are reopened after the reload. */
+  const BUILD = ($('meta[name="tnmm-build"]') || {}).content || '';
+  let updateReady = false, lastInput = Date.now(), reloadTimer = null;
+  ['keydown', 'pointerdown', 'input', 'wheel'].forEach(ev => document.addEventListener(ev, () => { lastInput = Date.now(); }, true));
+  async function checkUpdate() {
+    if (!BUILD || BUILD.includes('BUILD') || updateReady) return;
+    try {
+      const r = await fetch(location.pathname + '?v=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return;
+      const m = (await r.text()).match(/name="tnmm-build" content="([0-9a-f]+)"/);
+      if (m && m[1] !== BUILD) { updateReady = true; toast('A new version of the calculator is ready. It will reload by itself when you pause.'); tryReload(); }
+    } catch (e) { /* offline: try again later */ }
+  }
+  function unreadFiles() { return Object.keys(state.files).some(id => { const c = state.job && findCo(id); return c && !(c.extraction && c.extraction.at); }); }
+  function safeToReload() {
+    return !state.going && !Object.keys(state.busy).length && !saving && !saveTimer && !unreadFiles()
+      && !document.querySelector('.modal') && (document.hidden || Date.now() - lastInput > 30000);
+  }
+  async function tryReload() {
+    clearTimeout(reloadTimer);
+    if (!updateReady) return;
+    if (saveTimer) { clearTimeout(saveTimer); await saveNow(); }
+    if (!safeToReload()) { reloadTimer = setTimeout(tryReload, 5000); return; }
+    try { sessionStorage.setItem('tnmm-reopen', JSON.stringify({ id: state.job && !state.isExample ? state.job.id : '', tab: state.tab, updated: 1 })); } catch (e) { /* no storage */ }
+    location.reload();
+  }
+  function reopenAfterUpdate() {
+    try {
+      const v = JSON.parse(sessionStorage.getItem('tnmm-reopen') || 'null'); sessionStorage.removeItem('tnmm-reopen');
+      if (v && v.updated) setTimeout(() => toast('The calculator was updated to the latest version.'), 600);
+      return v;
+    } catch (e) { return null; }
+  }
+  setInterval(checkUpdate, 5 * 60000);
+  setTimeout(checkUpdate, 30000);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { if (updateReady) tryReload(); } else checkUpdate(); });
 
   initAuth();
 })();
