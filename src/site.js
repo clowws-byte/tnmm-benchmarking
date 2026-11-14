@@ -273,6 +273,7 @@
     return `<p class="basisnote">Blue figures are inputs from the audited accounts; type over any of them. Black figures are calculated. A dot marks an adjustment with a reason from the reading step (hover to read it).</p>
     <div class="gridwrap"><table class="g"><thead>${head}</thead><tbody>
       ${txtRow('Company name', 'name')}${txtRow('Registration no.', 'regno')}${txtRow('Business activity', 'activity')}${txtRow('Financial year end', 'fye')}
+      <tr><td>FYE date (for the comparable period test)</td>${cs.map(c => `<td class="in"><input class="cell txt" type="date" data-fid="${c.id}-fyedate" data-c="${c.id}" data-k="fyeDate" value="${esc(T.fyeDateOf(c))}"></td>`).join('')}</tr>
       ${sec('1.  Statement of profit or loss')}
       ${inRow(P.rev, 'rev', 'pl')}${inRow(P.cos, 'cos', 'pl')}${cRow(P.gp, k => fmt(k.gp))}
       ${['ooi', 'dist', 'admin', 'staff', 'ooe', 'fv'].map(k => inRow(P[k], k, 'pl')).join('')}
@@ -299,17 +300,20 @@
   function rejectHtml(job, R) {
     if (!job.comps.length) return '<p class="empty">Add comparables in the Companies tab first.</p>';
     const thr = Math.round(T.num(job.rptThreshold) * 100);
+    const W = T.windowOf(job);
     const sel = (c, k) => `<select data-fid="${c.id}-t-${k}" data-c="${c.id}" data-test="${k}"><option ${c.tests[k] === 'Pass' ? 'selected' : ''}>Pass</option><option ${c.tests[k] === 'Fail' ? 'selected' : ''}>Fail</option></select>`;
-    return `<div class="gridwrap" style="margin-top:12px"><table class="r"><thead><tr>
-      <th>Comparable</th><th>Turnover</th><th>≥ 10% of tested party?</th><th>RPT sales</th><th>RPT purchases</th><th>RPT ≤ ${thr}%?</th>
+    return `<p class="basisnote">Comparable period: ${W.from ? esc(fmtFye(W.from)) + ' to ' + esc(fmtFye(W.to)) : 'set the tested party FYE first'}. RPT sales are measured against turnover and RPT purchases against cost of sales (total costs if there is no cost of sales line).</p>
+    <div class="gridwrap" style="margin-top:12px"><table class="r"><thead><tr>
+      <th>Comparable</th><th>Turnover</th><th>≥ 10% of tested party?</th><th>RPT sales<br><small>% of turnover</small></th><th>RPT purchases<br><small>% of cost of sales</small></th><th>RPT ≤ ${thr}%?</th><th>FYE within comparable period?</th>
       <th>Functional comparability</th><th>Sufficient & verifiable data</th><th>No start-up / bankrupt / dormant</th><th>Reason (for your file)</th><th>Conclusion</th></tr></thead><tbody>
       ${R.rows.map(({ c, rej }) => `<tr>
         <td><b>${esc(c.name || 'Comparable')}</b><br><small class="meta">${esc(c.regno)}</small></td>
         <td class="num" style="text-align:right">${fmt(T.num(c.pl.rev), 0)}</td>
         <td>${rej.sizePass ? '<span class="chip good">Pass</span>' : '<span class="chip bad">Fail</span>'}<br><label style="font-size:11.5px"><input type="checkbox" data-c="${c.id}" data-k="sizeAcceptedByIrbm" ${c.sizeAcceptedByIrbm ? 'checked' : ''}> Accepted by IRBM</label></td>
         <td><input type="text" class="amt" data-fid="${c.id}-rs" data-c="${c.id}" data-rpt="sales" value="${T.num(c.rpt.sales) ? fmt(T.num(c.rpt.sales), 0) : ''}" placeholder="0"><small class="num">${pct(rej.rptSalesPct)}</small></td>
-        <td><input type="text" class="amt" data-fid="${c.id}-rp" data-c="${c.id}" data-rpt="purchases" value="${T.num(c.rpt.purchases) ? fmt(T.num(c.rpt.purchases), 0) : ''}" placeholder="0"><small class="num">${pct(rej.rptPurchPct)}</small></td>
+        <td><input type="text" class="amt" data-fid="${c.id}-rp" data-c="${c.id}" data-rpt="purchases" value="${T.num(c.rpt.purchases) ? fmt(T.num(c.rpt.purchases), 0) : ''}" placeholder="0"><small class="num">${pct(rej.rptPurchPct)}${rej.rptPurchBase === 'cos' ? '' : ' of total costs'}</small></td>
         <td>${rej.rptPass ? '<span class="chip good">Pass</span>' : '<span class="chip bad">Fail</span>'}</td>
+        <td>${rej.fyePass ? '<span class="chip good">Pass</span>' : '<span class="chip bad">Fail</span>'}<br><small class="meta">${rej.fyeDate ? esc(fmtFye(rej.fyeDate)) : 'No FYE date'}</small></td>
         <td>${sel(c, 'activity')}</td><td>${sel(c, 'data')}</td><td>${sel(c, 'special')}</td>
         <td><textarea data-fid="${c.id}-reason" data-c="${c.id}" data-reason="1" placeholder="Why it was accepted or rejected">${esc(Object.values(c.reasons || {}).join(' '))}</textarea></td>
         <td>${rej.accepted ? '<span class="chip good">Accepted</span>' : `<span class="chip bad">Rejected</span><br><small class="meta">${esc(rej.failed.join('; '))}</small>`}</td>
@@ -319,7 +323,7 @@
   /* ---- results tab ---- */
   function resultsHtml(job, R) {
     const b = R.basis;
-    return `<p class="basisnote">${esc(b.label)}${b.median ? '; median is the mid-point of the 37.5th and 62.5th percentiles.' : '. No median is shown for this basis.'} ${R.acc.length} of ${job.comps.length} comparables accepted.</p>
+    return `<p class="basisnote">${esc(b.label)}${b.median ? '; median is the mid-point of the 37.5th and 62.5th percentiles. Below the range, profit is adjusted up to the median; it is never adjusted down.' : '. No median is shown for this basis.'} ${R.acc.length} of ${job.comps.length} comparables accepted.</p>
     <div class="res">${Object.entries(PLI).map(([k, p]) => {
       const s = R.stat[k];
       return `<div class="panel"><div class="row" style="justify-content:space-between"><h3>${p.label}</h3>${concChip(s.concl)}</div>
@@ -329,7 +333,12 @@
           ${b.median ? `<span>Median</span><span class="hl">${p.f(s.med)}</span>` : ''}
           <span>Upper quartile (${b.hi * 100}th)</span><span class="hl">${p.f(s.hi)}</span>
           <span>Maximum</span><span>${p.f(s.max)}</span><span>Accepted comparables</span><span>${s.n}</span>
-          <span>Tested party</span><span class="hl">${p.f(s.tp)}</span></div></div>`;
+          <span>Tested party</span><span class="hl">${p.f(s.tp)}</span>
+          ${b.median ? (s.concl === 'Below range'
+            ? `<span>Arm's length ${k === 'berry' ? 'gross' : 'operating'} profit at median</span><span>${fmt(s.alp)}</span>
+               <span>Actual ${k === 'berry' ? 'gross profit' : 'NormOP'}</span><span>${fmt(s.actual)}</span>
+               <span>TP adjustment to median (RM)</span><span class="hl">${fmt(s.adj)}</span>`
+            : `<span>TP adjustment to median (RM)</span><span>${s.concl === 'n/a' ? '–' : '0'}</span>`) : ''}</div></div>`;
     }).join('')}</div>
     ${R.rows.some(r => !r.rej.accepted) ? `<div class="panel" style="margin-top:12px"><h3>Rejected comparables</h3><ul class="notes">${R.rows.filter(r => !r.rej.accepted).map(r => `<li><b>${esc(r.c.name)}</b>: ${esc(r.rej.failed.join('; '))}${Object.values(r.c.reasons || {}).length ? ' · ' + esc(Object.values(r.c.reasons).join(' ')) : ''}</li>`).join('')}</ul></div>` : ''}`;
   }
@@ -369,6 +378,12 @@
       else if (t.dataset.rpt) c.rpt[t.dataset.rpt] = T.num(t.value);
       else if (t.dataset.test) c.tests[t.dataset.test] = t.value;
       else if (t.dataset.reason) c.reasons = { note: t.value };
+      else if (t.dataset.k === 'fyeDate') {
+        c.fyeDate = t.value; if (t.value) c.fye = fmtFye(t.value);
+        if (c.isTested) suggestWindow(true);
+      } else if (t.dataset.k === 'fye') {
+        c.fye = t.value; const iso = T.toIso(t.value); if (iso) { c.fyeDate = iso; if (c.isTested) suggestWindow(true); }
+      }
       else if (t.dataset.k) c[t.dataset.k] = t.value;
     } else return;
     touch(); render();
@@ -688,6 +703,8 @@
   function applyExtraction(c, out, pages) {
     if (!out || typeof out !== 'object' || !out.pl) throw { code: 'invalid_json' };
     ['name', 'regno', 'activity', 'fye'].forEach(k => { if (out[k]) c[k] = String(out[k]).trim(); });
+    // comparables: the FYE read from the accounts drives the comparable period test; the tested party's date is set in Set up
+    if (!c.isTested) { const iso = T.toIso(c.fye); if (iso) c.fyeDate = iso; }
     T.PL_KEYS.forEach(k => c.pl[k] = T.num(out.pl[k]));
     c.pbtReported = out.pbt_reported === undefined || out.pbt_reported === null ? null : T.num(out.pbt_reported);
     T.ADJ_KEYS.forEach(k => c.adj[k] = 0); c.adjNotes = {};
@@ -717,7 +734,8 @@
     c.extraction = { at: Date.now(), pages, checked: false };
     const job = state.job;
     if (c.isTested && (!job.title || job.title === 'New benchmarking') && c.name) job.title = c.name + (c.fye ? ' – FYE ' + c.fye : '');
-    if (c.isTested && c.fye && !job.tp.fyeDate) { const d = parseFye(c.fye); if (d) { job.tp.fyeDate = fyeIso({ tp: { fye: c.fye } }); suggestWindow(true); } }
+    if (c.isTested && c.fye && !job.tp.fyeDate) { const iso = T.toIso(c.fye) || fyeIso({ tp: { fye: c.fye } }); if (iso) { job.tp.fyeDate = iso; suggestWindow(true); } }
+    if (!c.isTested && !T.fyeDateOf(c)) w.push('The financial year end could not be read as a date. Enter the FYE date in the Calculation tab, or the comparable fails the comparable period test.');
     touch();
   }
 
