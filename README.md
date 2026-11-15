@@ -20,7 +20,11 @@ to a formula-driven Excel workbook (two tabs: Calculation, Summary of Interquart
 - Rules follow the `tnmm-benchmarking-v3` skill: IRBM-supported adjustments only; rejection tests are
   turnover >= 10% of the tested party, RPT sales (of turnover) and RPT purchases (of cost of sales, or total
   costs if there is none) each <= 20%, comparable FYE within the comparable period (-6/+6 or -7/+5 months,
-  MTPG 2024 paras 4.5-4.7), plus the three manual tests. Range is 37.5th-62.5th percentile with mid-point
+  MTPG 2024 paras 4.5-4.7), plus the three manual tests.
+  Net cost plus margin = normalised operating profit / total costs, where total costs = cost of sales +
+  operating expenses less excluded items sitting in those lines (exceptional expense, investment property
+  depreciation, non-trade forex loss, plus an optional "other" input); other operating income is not netted
+  off costs (MTPG 2024 paras 3.57-3.58). Range is 37.5th-62.5th percentile with mid-point
   median (YA 2023+) or 25th-75th (before YA 2023). For YA 2023+, a tested party below the range gets the
   adjustment to the median for each PLI (never adjusted downwards). The Excel export mirrors the skill's
   `build_benchmark.py` layout.

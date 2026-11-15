@@ -47,7 +47,7 @@
     const adj = {}; ADJ_KEYS.forEach(k => adj[k] = 0);
     return {
       id: uid(), isTested: !!isTested, name: '', regno: '', activity: '', fye: '', fyeDate: '',
-      pl, adj, adjNotes: {}, pbtReported: null,
+      pl, adj, adjNotes: {}, pbtReported: null, costExclOther: 0,
       rpt: { sales: 0, purchases: 0 },
       tests: { activity: 'Pass', data: 'Pass', special: 'Pass' },
       reasons: {}, sizeAcceptedByIrbm: false,
@@ -62,6 +62,7 @@
     const out = { ...base, ...c, pl: { ...base.pl }, adj: { ...base.adj },
       rpt: { ...base.rpt, ...(c.rpt || {}) }, tests: { ...base.tests, ...(c.tests || {}) } };
     PL_KEYS.forEach(k => out.pl[k] = num(c.pl && c.pl[k]));
+    out.costExclOther = num(c.costExclOther);
     Object.entries(c.adj || {}).forEach(([k, v]) => { const k2 = LEGACY[k] || k; if (ADJ_KEYS.includes(k2)) out.adj[k2] = num(out.adj[k2]) + num(v); });
     return out;
   }
@@ -86,11 +87,16 @@
     const normop = pbt - p.fin + adjTotal;
     const opex = -(p.dist + p.admin + p.staff + p.ooe);
     const om = p.rev === 0 ? null : normop / p.rev;
-    const ncp = (p.rev - normop) === 0 ? null : normop / (p.rev - normop);
+    // Total costs = cost of sales + operating expenses, less excluded items sitting in those lines
+    // (MTPG 2024 paras 3.57-3.58). Other operating income is not netted off costs.
+    const a = k => num(c.adj[k]);
+    const tc = -p.cos + opex - a('add_exceptional_expense') - a('add_ip_depreciation')
+      - Math.max(a('adj_nontrade_forex'), 0) - num(c.costExclOther);
+    const ncp = tc === 0 ? null : normop / tc;
     const berry = opex === 0 ? null : gp / opex;
     const pbtCheck = (c.pbtReported === null || c.pbtReported === undefined || c.pbtReported === '')
       ? null : Math.abs(num(c.pbtReported) - pbt) < 1.5;
-    return { ...p, gp, pfo, pbt, pat, adjTotal, normop, opex, om, ncp, berry, pbtCheck };
+    return { ...p, gp, pfo, pbt, pat, adjTotal, normop, opex, tc, om, ncp, berry, pbtCheck };
   }
 
   /* ---------- dates: FYE and the comparable FYE window (MTPG 2024 paras 4.5-4.7) ---------- */
@@ -132,9 +138,9 @@
   function rejection(job, c) {
     const tpRev = num(job.tp.pl.rev), rev = num(c.pl.rev), cos = num(c.pl.cos), thr = num(job.rptThreshold) || 0.2;
     const sizePass = c.sizeAcceptedByIrbm || rev >= 0.1 * tpRev;
-    // RPT sales / turnover; RPT purchases / cost of sales (if no cost of sales, / total costs = turnover - NormOP)
+    // RPT sales / turnover; RPT purchases / cost of sales (if no cost of sales, / total costs)
     const rptSalesPct = rev === 0 ? 0 : num(c.rpt.sales) / rev;
-    const totalCost = rev - calcCompany(c).normop;
+    const totalCost = calcCompany(c).tc;
     const rptPurchBase = cos !== 0 ? 'cos' : 'total costs';
     const rptPurchPct = cos !== 0 ? num(c.rpt.purchases) / -cos : (totalCost === 0 ? 0 : num(c.rpt.purchases) / totalCost);
     const rptPass = !(rptSalesPct > thr || rptPurchPct > thr);
@@ -173,7 +179,7 @@
       // Adjustment to the median (YA 2023+, TP Rules 2023 r.13(2)(b)): only when Below range; never downwards.
       let alp = null, actual = null, adj = 0;
       if (b.median && med !== null && concl === 'Below range') {
-        const base = k === 'om' ? tp.rev : k === 'ncp' ? tp.rev - tp.normop : tp.opex;
+        const base = k === 'om' ? tp.rev : k === 'ncp' ? tp.tc : tp.opex;
         actual = k === 'berry' ? tp.gp : tp.normop;
         alp = med * base; adj = alp - actual;
       }
@@ -269,7 +275,8 @@
     const adjrows = [r]; r++;
     S('A' + r, 'Add back: Finance costs'); cols.forEach(col => S(col + r, `=-${col}${rows.fin}`, { fmt: NUM2, bord: true }));
     adjrows.push(r); r++;
-    ADJ_KEYS.forEach(k => { S('A' + r, ADJ_LABELS[k]); cols.forEach(col => S(col + r, num(by[col].adj[k]), { font: BLUE, fmt: NUM2, bord: true })); adjrows.push(r); r++; });
+    const adjrow = {};
+    ADJ_KEYS.forEach(k => { S('A' + r, ADJ_LABELS[k]); cols.forEach(col => S(col + r, num(by[col].adj[k]), { font: BLUE, fmt: NUM2, bord: true })); adjrows.push(r); adjrow[k] = r; r++; });
     r++;
 
     section(r, '3.  NORMALISED OPERATING PROFIT'); r++;
@@ -278,14 +285,22 @@
     rows.normop = r++;
     S('A' + r, 'Total operating expenses');
     cols.forEach(col => S(col + r, `=-(${col}${rows.dist}+${col}${rows.admin}+${col}${rows.staff}+${col}${rows.ooe})`, { fmt: NUM2, bord: true }));
-    rows.opex = r; r += 2;
+    rows.opex = r++;
+    // Total costs = cost of sales + operating expenses, less excluded items sitting in those lines (MTPG 2024 paras 3.57-3.58)
+    S('A' + r, 'Less: Excluded items within cost lines (other)');
+    cols.forEach(col => S(col + r, num(by[col].costExclOther), { font: BLUE, fmt: NUM2, bord: true }));
+    rows.costexcl = r++;
+    S('A' + r, 'Total costs', { font: BLACKB });
+    const ee = adjrow.add_exceptional_expense, ipd = adjrow.add_ip_depreciation, fx = adjrow.adj_nontrade_forex;
+    cols.forEach(col => S(col + r, `=-${col}${rows.cos}+${col}${rows.opex}-${col}${ee}-${col}${ipd}-MAX(${col}${fx},0)-${col}${rows.costexcl}`, { font: BLACKB, fmt: NUM2, bord: true }));
+    rows.tc = r; r += 2;
 
     section(r, '4.  PROFIT LEVEL INDICATORS'); r++;
     S('A' + r, 'Operating margin  (NormOP / Revenue)');
     cols.forEach(col => S(col + r, `=IF(${col}${rows.rev}=0,"",${col}${rows.normop}/${col}${rows.rev})`, { fmt: PCT, bord: true }));
     rows.ros = r++;
-    S('A' + r, 'Net cost plus margin  (NormOP / (Revenue - NormOP))');
-    cols.forEach(col => S(col + r, `=IF((${col}${rows.rev}-${col}${rows.normop})=0,"",${col}${rows.normop}/(${col}${rows.rev}-${col}${rows.normop}))`, { fmt: PCT, bord: true }));
+    S('A' + r, 'Net cost plus margin  (NormOP / Total costs)');
+    cols.forEach(col => S(col + r, `=IF(${col}${rows.tc}=0,"",${col}${rows.normop}/${col}${rows.tc})`, { fmt: PCT, bord: true }));
     rows.ncpm = r++;
     S('A' + r, 'Berry ratio  (Gross profit / Operating expenses)');
     cols.forEach(col => S(col + r, `=IF(${col}${rows.opex}=0,"",${col}${rows.gp}/${col}${rows.opex})`, { fmt: MULT, bord: true }));
@@ -312,10 +327,10 @@
       else S('C' + r, `=IF(B${r}>=0.1*${TPrev},"Pass","Fail")`, { align: 'center', bord: true });
       S('M' + r, num(cc.rpt.sales), { font: BLUE, fmt: NUM, bord: true });
       S('N' + r, num(cc.rpt.purchases), { font: BLUE, fmt: NUM, bord: true });
-      const cos = `${col}${rows.cos}`, nop = `${col}${rows.normop}`;
+      const cos = `${col}${rows.cos}`, tc = `${col}${rows.tc}`;
       S('D' + r, `=IF(B${r}=0,0,M${r}/B${r})`, { fmt: PCT, bord: true });
-      // RPT purchases / cost of sales; if no cost of sales line, / total costs (turnover - NormOP)
-      S('E' + r, `=IF(${cos}<>0,N${r}/-${cos},IF((B${r}-${nop})=0,0,N${r}/(B${r}-${nop})))`, { fmt: PCT, bord: true });
+      // RPT purchases / cost of sales; if no cost of sales line, / total costs
+      S('E' + r, `=IF(${cos}<>0,N${r}/-${cos},IF(${tc}=0,0,N${r}/${tc}))`, { fmt: PCT, bord: true });
       S('F' + r, `=IF(OR(D${r}>${thr},E${r}>${thr}),"Fail","Pass")`, { align: 'center', bord: true });
       const fd = `${col}${fyedateRow}`;
       S('G' + r, `=IF(AND(ISNUMBER(${fd}),${fd}>=${WFROM},${fd}<=${WTO}),"Pass","Fail")`, { align: 'center', bord: true });
@@ -387,7 +402,7 @@
     if (st.med) {
       r++;
       const t = k => `Calculation!${tpCol}${rows[k]}`;
-      const base = { C: t('rev'), D: `(${t('rev')}-${t('normop')})`, E: t('opex') };   // PLI denominator
+      const base = { C: t('rev'), D: t('tc'), E: t('opex') };   // PLI denominator
       const actual = { C: t('normop'), D: t('normop'), E: t('gp') };                    // PLI numerator
       SS('A' + r, 'ADJUSTMENT TO MEDIAN (if below range)', { font: WHITEB, fill: HDRF });
       ['B', 'C', 'D', 'E'].forEach(col => { s.getCell(col + r).fill = HDRF; });

@@ -292,9 +292,11 @@
       ${sec('3.  Normalised operating profit')}
       ${cRow('Normalised operating profit', k => fmt(k.normop), 'tot key')}
       ${cRow('Total operating expenses', k => fmt(k.opex), '')}
+      <tr><td>Less: Excluded items within cost lines (other)</td>${cs.map(c => { const n = T.num(c.costExclOther); return `<td class="in"><input class="cell" inputmode="decimal" data-fid="${c.id}-costexcl" data-c="${c.id}" data-k="costExclOther" value="${n ? fmt(n) : ''}" placeholder="–" title="Excluded losses inside cost of sales or operating expenses not already taken out automatically (exceptional expense, investment property depreciation and non-trade forex loss are automatic). Negative to reverse an automatic one."></td>`; }).join('')}</tr>
+      ${cRow('Total costs', k => fmt(k.tc))}
       ${sec('4.  Profit level indicators')}
       ${cRow('Operating margin  (NormOP / Revenue)', k => pct(k.om), '')}
-      ${cRow('Net cost plus margin  (NormOP / (Revenue − NormOP))', k => pct(k.ncp), '')}
+      ${cRow('Net cost plus margin  (NormOP / Total costs)', k => pct(k.ncp), '')}
       ${cRow('Berry ratio  (Gross profit / Operating expenses)', k => mult(k.berry), '')}
     </tbody></table></div>`;
   }
@@ -376,6 +378,7 @@
       const c = findCo(t.dataset.c); if (!c) return;
       if (t.dataset.g === 'pl') c.pl[t.dataset.k] = T.num(t.value);
       else if (t.dataset.g === 'adj') c.adj[t.dataset.k] = T.num(t.value);
+      else if (t.dataset.k === 'costExclOther') c.costExclOther = T.num(t.value);
       else if (t.dataset.k === 'pbtReported') c.pbtReported = t.value.trim() === '' ? null : T.num(t.value);
       else if (t.dataset.k === 'sizeAcceptedByIrbm') c.sizeAcceptedByIrbm = t.checked;
       else if (t.dataset.rpt) c.rpt[t.dataset.rpt] = T.num(t.value);
