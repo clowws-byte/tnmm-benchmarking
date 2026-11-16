@@ -544,8 +544,9 @@
      so reading the same file again, even after a refresh, is instant and costs no new OCR. */
   const CACHE_MS = 14 * 86400000; // 14 days
   /* Change when the server's reading instructions change, so files are read once more instead of reusing old text.
-     v2: targeted read of the sections the calculation uses, including the statement of cash flows. */
-  const READ_VERSION = 'v2';
+     v2: targeted read of the sections the calculation uses, including the statement of cash flows.
+     v3: company-level figures only (Group / consolidated columns left out). */
+  const READ_VERSION = 'v3';
   const sha256hex = async buf => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf))).map(x => x.toString(16).padStart(2, '0')).join('');
   const IDB = { db: null };
   function idb() {
