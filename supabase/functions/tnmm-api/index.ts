@@ -136,12 +136,14 @@ Write out ONLY the parts listed below. Put each page you use under a line "=== P
 3. The statement of profit or loss (and other comprehensive income): every line item and every figure, all year columns.
 4. The statement of cash flows: every line item and every figure, all year columns (the "adjustments for" lines under operating activities matter most).
 5. These notes only, with the note number and heading: revenue; cost of sales; other income / other operating income; finance costs; interest or finance income; profit before taxation ("arrived at after charging / crediting"); employee benefits or staff costs; investment properties (only depreciation and rental income); related party transactions (only the transactions and their amounts); income tax expense (only the tax expense lines).
-Write every amount in Markdown tables: one row per line item with the item name as printed, one column per financial year headed by its year-end date. Keep brackets for negatives and state the unit (RM or RM'000) as printed.
+Write every amount in Markdown tables: one row per line item with the item name as printed, one column per financial year headed by its year-end date.
+COMPANY LEVEL ONLY: if the statements show both Group (consolidated) and Company columns, or separate Group and Company statements, write out only the Company figures (the company's own separate financial statements) and leave out every Group / consolidated column, statement and note amount. Head each year column with "Company" and its year-end date. If the file has only consolidated (Group) statements and no Company figures, say so in one line at the top and write the Group figures under columns headed "Group". Keep brackets for negatives and state the unit (RM or RM'000) as printed.
 Skip everything else: auditors' report, directors' statements, statutory declaration, statement of financial position, changes in equity, accounting policies and all other notes. Do not copy narrative sentences; where a note needs explaining, add one short line in your own words. No commentary.`;
 /* Used when Google blocks the targeted read (RECITATION): figures in tables only, narrative in own words. */
 const FIGURES_ONLY = `Read this company's financial statements and write a Markdown data sheet, page by page. Start every page you cover with a line "=== PAGE n ===" (n = page number in the file, starting at 1).
 Cover only: the cover or first page (company name and registration number), the principal activities, the statement of profit or loss / comprehensive income, the statement of cash flows, and the notes on revenue, cost of sales, other income, finance costs, profit before tax ("after charging / crediting"), taxation and related party transactions.
-Put every amount in Markdown tables: one row per line item, the line item as printed, and one column per financial year with the year-end date as the column heading. Keep brackets for negative amounts and keep the RM or RM'000 unit.
+Put every amount in Markdown tables: one row per line item, the line item as printed, and one column per financial year with the year-end date as the column heading.
+COMPANY LEVEL ONLY: if the statements show both Group (consolidated) and Company columns, or separate Group and Company statements, write out only the Company figures (the company's own separate financial statements) and leave out every Group / consolidated column, statement and note amount. Head each year column with "Company" and its year-end date. If the file has only consolidated (Group) statements and no Company figures, say so in one line at the top and write the Group figures under columns headed "Group". Keep brackets for negative amounts and keep the RM or RM'000 unit.
 Do not copy sentences or accounting policy wording. Where a note has narrative, summarise it in one short line in your own words.
 Skip all other pages. Do not add commentary.`;
 async function runOcrGemini(db: any, runId: string, path: string, mime: string) {
@@ -217,6 +219,8 @@ function extractPrompt(ctx: { role: string; fye?: string; window?: string; kind?
   const body = pages.map(p => `=== PAGE ${p.index + 1} ===\n${p.markdown}`).join("\n\n");
   return `You are a Malaysian transfer pricing analyst preparing a TNMM benchmarking. Below is text (Markdown) from one company's ${ctx.kind === "management" ? "management accounts" : "financial statements (audited accounts or management accounts)"}. ${target}
 
+Use COMPANY-LEVEL figures only (the company's own separate financial statements). Where the text shows Group / consolidated and Company columns or statements, take every figure (profit or loss, notes, cash flow, related party transactions) from the Company column and never from Group / consolidated. If only consolidated (Group) figures are available, use them but say so in warnings.
+
 Read every figure exactly from the text. Do not estimate. If the text is management accounts with different line names, map each line to the closest key below and say so in warnings. Check: gross profit = revenue + cost of sales, and your computed PBT must equal the PBT shown in the statement of profit or loss.
 
 1. Statement of profit or loss, signed: income positive, expenses and losses negative, figures in full ringgit (multiply by 1000 if presented in RM'000). Keys:
@@ -241,7 +245,7 @@ Every line on the face must land in exactly one key so that rev+cos+ooi+dist+adm
 Use the statement of cash flows ("adjustments for" lines under operating activities) to find or confirm these items when the notes do not show them (for example interest income, dividend income, gains or losses on investments, unrealised foreign exchange, impairment, depreciation of investment properties), and give its page as the source. Never take amounts for the profit or loss lines from the cash flow statement.
 Do NOT adjust these; list them under kept_in: PPE disposal gains or losses, trade foreign exchange (realised or unrealised), normal bad debts or their reversals, payables written back, routine write-offs, depreciation of property, plant and equipment. Finance costs are added back automatically, so do not include them.
 
-3. Related party transactions for the same year: total sales to related parties and total purchases from related parties, in full ringgit; 0 if none disclosed.
+3. Related party transactions for the same year, company level: total sales to related parties and total purchases from related parties, in full ringgit; 0 if none disclosed.
 
 4. Company details: name, registration number as printed (e.g. "450571-M (199701035071)"), principal activity in a few words, and the financial year end used, like "31 Dec 2023".
 
